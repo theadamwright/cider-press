@@ -1,0 +1,85 @@
+name: CI
+
+# What CI can and cannot cover here.
+#
+# The unit tests are pure functions: config/TOML editing, `container` output
+# parsing, `pgd` JSON shapes, table padding. Those run anywhere, so they run on
+# ubuntu-latest, which is free and fast.
+#
+# What CI cannot do is exercise a real cluster: that needs Apple silicon,
+# macOS 26+, the `container` runtime, and an EDB subscription token. So a green
+# build here means "the logic is sound and the code is clean", not "a cluster
+# comes up". Verifying that is still a manual `cider pgd up` on a Mac.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Runners are pinned to a specific Ubuntu major rather than ubuntu-latest.
+# `latest` is a moving target: GitHub repoints it at each new LTS, and a build
+# that passes today can fail on a morning you did not change anything. Bump this
+# deliberately, when you choose to.
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # -D warnings: clippy is currently clean, so keep it that way.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The entrypoint does the actual cluster provisioning, so a syntax slip
+      # there is far more expensive than one in the Rust: it surfaces as a node
+      # that will not boot, minutes into `cider pgd up`.
+      - name: Shellcheck
+        run: shellcheck --severity=warning image/entrypoint.sh cider
+
+  secrets:
+    name: no committed credentials
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Belt and braces alongside .gitignore. The EDB subscription token is a
+      # 32-character alphanumeric string; refuse anything that looks like one
+      # assigned to the variable, and refuse a committed .env outright.
+      - name: Scan for a subscription token
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is committed; it must stay gitignored"
+            exit 1
+          fi
+          if grep -rInE 'EDB_SUBSCRIPTION_TOKEN=[A-Za-z0-9]{16,}' \
+               --exclude-dir=.git . ; then
+            echo "::error::what looks like a real subscription token is committed"
+            exit 1
+          fi
+          echo "no credentials found"

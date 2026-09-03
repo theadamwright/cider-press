@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# Thin launcher: builds the Rust binary on first use (or after a source
+# change), then hands over to it. Keeps `./cider doctor` working straight
+# after a clone, without making you think about cargo.
+#
+# Prefer the real binary directly once it exists: ./target/release/cider
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$ROOT/target/release/cider"
+
+needs_build() {
+    [ ! -x "$BIN" ] && return 0
+    # Rebuild when any source file is newer than the binary.
+    [ -n "$(find "$ROOT/src" "$ROOT/Cargo.toml" -newer "$BIN" -print -quit 2>/dev/null)" ]
+}
+
+if needs_build; then
+    if ! command -v cargo >/dev/null 2>&1; then
+        cat >&2 <<'EOF'
+error: cider is written in Rust and has not been built yet, but cargo was not found.
+
+  Install Rust:   https://rustup.rs
+  then re-run:    ./cider <product> <command>
+EOF
+        exit 1
+    fi
+    echo "building cider (first run, or sources changed)..." >&2
+    ( cd "$ROOT" && cargo build --release --quiet )
+fi
+
+export CIDER_ROOT="$ROOT"
+exec "$BIN" "$@"

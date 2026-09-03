@@ -1,0 +1,29 @@
+[package]
+name = "cider-press"
+version = "0.1.0"
+edition = "2024"
+description = "Press a multi-node EDB Postgres Distributed cluster out of Apple's container runtime"
+license = "PostgreSQL"
+readme = "README.md"
+keywords = ["postgres", "pgd", "edb", "container", "macos"]
+categories = ["command-line-utilities", "development-tools"]
+# Not published to crates.io: this drives a local lab, not a library.
+publish = false
+
+[[bin]]
+name = "cider"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+dotenvy = "0.15"
+libc = "0.2.189"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml_edit = "0.25"
+ureq = { version = "3.4", features = ["json"] }
+
+[profile.release]
+opt-level = "s"
+strip = true
