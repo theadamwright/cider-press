@@ -124,6 +124,31 @@ pub fn state(name: &str) -> State {
     }
 }
 
+/// Stop a container with an explicit signal and grace period.
+///
+/// Both of `container stop`'s defaults are wrong for Postgres, and the
+/// combination is expensive rather than merely untidy.
+///
+/// The default signal is SIGTERM, which Postgres defines as a *smart*
+/// shutdown: stop accepting new connections, then wait for every existing
+/// client to disconnect. PGD nodes hold persistent connections to each other,
+/// so on a running cluster that wait does not end on its own.
+///
+/// The default grace period is five seconds. So the smart shutdown stalls, the
+/// timer expires, and the runtime SIGKILLs the server. The node is then
+/// unclean on disk and crash-recovers on the way back up, which is what made
+/// `cider pgd up` on existing volumes take minutes instead of seconds.
+///
+/// SIGINT is a *fast* shutdown: roll back open transactions, disconnect
+/// clients, checkpoint, exit. That is the correct signal, and it needs more
+/// than five seconds to finish on a node with real work in it.
+pub fn stop_with_signal(name: &str, signal: &str, timeout_secs: u64) -> bool {
+    // The timeout is a ceiling, not a sleep: a clean shutdown returns as soon
+    // as it is done, so a generous value costs nothing in the common case.
+    let timeout = timeout_secs.to_string();
+    quiet_ok(&["stop", "--signal", signal, "--time", &timeout, name])
+}
+
 /// Is `domain` registered with the host resolver?
 ///
 /// Ask `container` rather than looking for a file: it names the resolver file

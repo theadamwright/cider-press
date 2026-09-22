@@ -123,6 +123,18 @@ RUN chmod 0755 /usr/local/bin/cider-press-entrypoint
 # 6437 PGD Monitor web UI, REST API and /metrics (Postgres port + 1005)
 EXPOSE 5432 6432 6433 6434 6437
 
+# Postgres reads SIGTERM, the OCI default, as a *smart* shutdown: refuse new
+# connections, then wait for every existing client to disconnect. PGD nodes
+# hold connections open to each other, so on a live cluster that wait does not
+# end, the runtime's kill timer expires, and the server dies uncleanly and
+# crash-recovers on the next start.
+#
+# SIGINT is a fast shutdown, which is what a container stop should mean here.
+# cider passes the signal explicitly (see container::stop_with_signal), so this
+# is for anyone running `container stop host-1` by hand -- which the README's
+# own failover walkthrough tells you to do.
+STOPSIGNAL SIGINT
+
 # Starts as root so it can fix ownership on the freshly-mounted volume, then
 # re-execs itself as the Postgres superuser via setpriv.
 ENTRYPOINT ["/usr/local/bin/cider-press-entrypoint"]

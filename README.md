@@ -859,6 +859,16 @@ Run `cargo test` for the unit tests — they cover the config rewriter, the
 - Apple `container` has no restart policy, so nodes don't come back after a
   reboot. `cider pgd start` brings them back.
 - Each node is a lightweight VM, not a process — three at 2 GB is ~6 GB of RAM.
+  In practice they hold less: allocation is lazy, so three 2 GB nodes measured
+  about 2.9 GB resident rather than 6.
+- **Nodes are stopped with SIGINT, not SIGTERM.** Postgres reads SIGTERM as a
+  *smart* shutdown and waits for every client to disconnect — and PGD nodes
+  hold connections open to each other, so that wait never ends. `container
+  stop` then kills the server after its five-second default and the node
+  crash-recovers on the way back up. `cider pgd stop` / `down` / `pomace` pass
+  `--signal SIGINT --time 60` instead, and the image sets `STOPSIGNAL SIGINT`
+  so a hand-run `container stop host-1` behaves the same way. Rebuild the image
+  if you want that second part.
 - The web UI is plain HTTP, and `pg_stat_statements` aside, nothing here is
   tuned — the defaults are whatever PGD ships. See
   [What this is for](#what-this-is-for) for the rest of the caveats.

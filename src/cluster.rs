@@ -19,6 +19,27 @@ const NODE_ATTEMPTS: u32 = 2;
 /// this is a courtesy, not a health check, and `up` succeeds regardless.
 const CM_READY_TIMEOUT_SECS: u64 = 60;
 
+/// The signal that gives Postgres a *fast* shutdown.
+///
+/// Postgres reads SIGTERM, which is what `container stop` sends by default, as
+/// a smart shutdown that waits for every client to disconnect — and PGD nodes
+/// keep connections open to each other, so it waits forever and gets killed.
+/// See `container::stop_with_signal` for the whole story.
+const PG_STOP_SIGNAL: &str = "SIGINT";
+
+/// Grace period for a node to shut down before the runtime kills it. This is a
+/// ceiling: a clean shutdown of an idle node takes about a second.
+const PG_STOP_TIMEOUT_SECS: u64 = 60;
+
+/// Stop one node cleanly, so the next start does not pay crash recovery.
+///
+/// Every path that stops a node goes through here. Getting this wrong is not
+/// visible at the time — the container stops either way — and shows up later
+/// as a slow `up`, which is a long way from the cause.
+fn stop_node(name: &str) -> bool {
+    container::stop_with_signal(name, PG_STOP_SIGNAL, PG_STOP_TIMEOUT_SECS)
+}
+
 // --- build -----------------------------------------------------------------
 
 /// Build the node image.
@@ -802,7 +823,7 @@ pub fn stop(cfg: &Config) -> Result<()> {
     for i in 1..=cfg.nodes {
         let name = cfg.host_name(i);
         if container::state(&name) == container::State::Running {
-            if container::quiet_ok(&["stop", &name]) {
+            if stop_node(&name) {
                 term::ok(&format!("stopped {name}"));
             } else {
                 term::warn(&format!("could not stop {name}"));
@@ -843,7 +864,9 @@ pub fn down(cfg: &Config) -> Result<()> {
         match container::state(&name) {
             container::State::Absent => println!("  {}", term::dim(&format!("{name} not present"))),
             _ => {
-                let _ = container::quiet_ok(&["stop", &name]);
+                // Clean shutdown first: `up` afterwards brings this same node
+                // back, and a node killed here recovers on the way up.
+                let _ = stop_node(&name);
                 if container::quiet_ok(&["delete", &name]) {
                     term::ok(&format!("removed {name}"));
                 }
@@ -903,7 +926,10 @@ pub fn pomace(cfg: &Config, assume_yes: bool, remove_dns: bool) -> Result<()> {
     for i in 1..=cfg.nodes {
         let name = cfg.host_name(i);
         if container::exists(&name) {
-            let _ = container::quiet_ok(&["stop", &name]);
+            // The volume is about to be deleted, so recovery cost is moot, but
+            // a fast shutdown still returns sooner than waiting out the kill
+            // timer.
+            let _ = stop_node(&name);
             if container::quiet_ok(&["delete", &name]) {
                 term::ok(&format!("removed container {name}"));
             }

@@ -44,3 +44,8 @@ credentials.*
 *.swp
 *.swo
 *~
+# Benchamrking files
+capture-numbers.sh
+cider-numbers.txt
+verify-fix.sh
+verify-fix.txt
