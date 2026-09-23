@@ -203,7 +203,7 @@ stopped and leaves running nodes alone.
 
 ### 3. Connect to the write leader
 
-PGD is active-active, but when going through the Connection Manager, writes are routed to one node at a time for string consistency requirements. Rather than tracking which one, connect through **Connection Manager**, which routes port
+PGD is active-active, but when going through the Connection Manager, writes are routed to one node at a time for strong consistency requirements. Rather than tracking which one, connect through **Connection Manager**, which routes port
 6432 to whichever node currently holds write leadership.
 
 The short way:
