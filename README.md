@@ -675,9 +675,9 @@ committing it hard:
 - **The build audits itself**, failing if any credential-bearing
   `downloads.enterprisedb.com` URL survives under `/etc`.
 
-The EDB quickstart's own Dockerfile passes the token as a build arg and leaves
-the repo files in place; both are fixed here. Anyone cloning this exports their
-own token — nothing about the subscription is baked into the repo.
+None of this is strictly required for a throwaway local cluster, but a
+subscription token is worth being careful with by default. Anyone cloning this
+exports their own token — nothing about the subscription is baked into the repo.
 
 ---
 
