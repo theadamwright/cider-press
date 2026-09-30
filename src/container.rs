@@ -196,6 +196,38 @@ pub fn exec_capture(name: &str, env: &[(&str, &str)], cmd: &[&str]) -> Option<St
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Does the runtime's DNS answer for `host`, as seen from inside container
+/// `from`?
+///
+/// `Some(false)` means the name is definitely not registered. `None` means the
+/// question could not be asked — typically `from` has only just started and
+/// cannot be exec'd into yet — which is not the same thing and should not be
+/// reported as a DNS problem.
+///
+/// Why this matters: after a container starts, the runtime sometimes takes a
+/// minute or more to register its name. Until then the node cannot start
+/// Postgres (its entrypoint waits for its own name) and its peers cannot reach
+/// it, which looks like a fault when nothing is wrong.
+pub fn resolves_inside(from: &str, host: &str) -> Option<bool> {
+    // The name goes in as $1, not spliced into the script.
+    let out = exec_capture(
+        from,
+        &[],
+        &[
+            "sh",
+            "-c",
+            r#"getent hosts "$1" >/dev/null && echo yes || echo no"#,
+            "sh",
+            host,
+        ],
+    )?;
+    match out.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Run a command in a container, caring only whether it succeeded.
 pub fn exec_ok(name: &str, env: &[(&str, &str)], cmd: &[&str]) -> bool {
     exec_capture(name, env, cmd).is_some()

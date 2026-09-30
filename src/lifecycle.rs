@@ -37,6 +37,27 @@ const PG_STOP_SIGNAL: &str = "SIGINT";
 /// ceiling: a clean shutdown of an idle node takes about a second.
 const PG_STOP_TIMEOUT_SECS: u64 = 60;
 
+/// How long a node may take before `up` checks whether the runtime's DNS is
+/// the hold-up. Registration normally takes well under a second, so a note
+/// before this would appear on perfectly ordinary starts.
+const DNS_EXPLAIN_AFTER_SECS: u64 = 6;
+
+/// Explain why a node whose name is not in the runtime's DNS yet is not a
+/// fault. Shared by `up` and `status`, so both say the same thing.
+///
+/// The runtime sometimes takes a minute or more to register a container's name
+/// after it starts, created or restarted. See the README's Troubleshooting.
+///
+/// "Three minutes" is the entrypoint's own limit (`PGD_SELF_RESOLVE_TIMEOUT`,
+/// 180s, passed to `wait_for_self` in image/entrypoint.sh). Change them
+/// together.
+pub fn explain_dns_wait(fqdn: &str) {
+    term::warn(&format!("{fqdn} is not in the runtime's DNS yet"));
+    term::note("After a container starts, the runtime can take a minute or two to register");
+    term::note("its name. The node starts, and its peers reach it, as soon as it appears.");
+    term::note("If it has not appeared within three minutes, the node gives up and says why.");
+}
+
 /// Where every image mounts its node's volume. A convention the images share,
 /// not a setting: each image's `PGDATA` and log live under it.
 const NODE_STATE_DIR: &str = "/var/lib/cider-press";
@@ -286,9 +307,11 @@ pub fn base_run_args(cfg: &Config, d: &Deployment, i: u16) -> Vec<String> {
 /// not yet ready. Only the last one is worth waiting on.
 fn wait_for_node(d: &Deployment, i: u16, ready: &impl Fn(u16) -> bool) -> Result<()> {
     let name = d.host_name(i);
+    let fqdn = d.host_fqdn(i);
     print!("  waiting for {name} ");
     std::io::stdout().flush().ok();
     let mut waited = 0u64;
+    let mut dns_explained = false;
     while waited < d.ready_timeout {
         // A node whose entrypoint gave up leaves a *stopped* container, not an
         // absent one, so both count as failure.
@@ -309,6 +332,17 @@ fn wait_for_node(d: &Deployment, i: u16, ready: &impl Fn(u16) -> bool) -> Result
         if ready(i) {
             println!(" {}", term::green("ready"));
             return Ok(());
+        }
+        // A long wait is usually the runtime's DNS, not the node. Say so once,
+        // rather than leave a line of dots that looks like a hang.
+        if !dns_explained
+            && waited >= DNS_EXPLAIN_AFTER_SECS
+            && container::resolves_inside(&name, &fqdn) == Some(false)
+        {
+            println!();
+            explain_dns_wait(&fqdn);
+            print!("  still waiting for {name} ");
+            dns_explained = true;
         }
         print!(".");
         std::io::stdout().flush().ok();
@@ -402,13 +436,19 @@ pub fn stop(d: &Deployment) -> Result<()> {
 }
 
 /// Start previously stopped node containers.
+///
+/// Returns as soon as the containers are running, not when the nodes are
+/// ready — so it says what to expect in between, rather than leave `status`
+/// to report `Unreachable` with no explanation.
 pub fn start(d: &Deployment) -> Result<()> {
+    let mut started = 0;
     for i in 1..=d.nodes {
         let name = d.host_name(i);
         match container::state(&name) {
             container::State::Stopped => {
                 if container::quiet_ok(&["start", &name]) {
                     term::ok(&format!("started {name}"));
+                    started += 1;
                 }
             }
             container::State::Running => term::ok(&format!("{name} already running")),
@@ -416,6 +456,14 @@ pub fn start(d: &Deployment) -> Result<()> {
                 term::warn(&format!("{name} does not exist — run: {}", d.hint("up")))
             }
         }
+    }
+    if started > 0 {
+        println!();
+        term::note("Nodes can show Unreachable for a minute or two while the runtime");
+        term::note(&format!(
+            "registers their names in DNS. Check with: {}",
+            d.hint("status")
+        ));
     }
     Ok(())
 }

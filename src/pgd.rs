@@ -421,6 +421,7 @@ pub fn status(cfg: &Config) -> Result<()> {
                 None
             };
             state::render(cfg, &c, health);
+            explain_unreachable(cfg, &c);
         }
         None => {
             term::warn("could not read cluster state — falling back to container view");
@@ -429,6 +430,62 @@ pub fn status(cfg: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Say why a node shows `Unreachable`, when cider can tell.
+///
+/// Two causes account for nearly every case in this lab, and they need
+/// opposite responses: the node's container is not running (start it), or it
+/// is running but the runtime has not registered its name in DNS yet (wait).
+/// The container is checked first because a stopped container's name leaves
+/// DNS too, and blaming the runtime for a node you stopped would mislead.
+/// Anything else is left to the table; guessing would be worse.
+fn explain_unreachable(cfg: &Config, c: &state::Cluster) {
+    let d = deployment(cfg);
+    let Ok(entry) = first_running(cfg) else {
+        return;
+    };
+    let entry = d.host_name(entry);
+
+    for n in c
+        .nodes
+        .iter()
+        .filter(|n| n.status.to_ascii_lowercase().contains("unreachable"))
+    {
+        let Some(i) = n
+            .name
+            .strip_prefix(&cfg.pgd.node_prefix)
+            .and_then(|s| s.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let name = d.host_name(i);
+        let fqdn = d.host_fqdn(i);
+        match container::state(&name) {
+            container::State::Stopped => {
+                println!();
+                term::warn(&format!(
+                    "{} is Unreachable because {name} is stopped — run: {}",
+                    n.name,
+                    d.hint("start")
+                ));
+            }
+            container::State::Absent => {
+                println!();
+                term::warn(&format!(
+                    "{} is Unreachable because {name} does not exist — run: {}",
+                    n.name,
+                    d.hint("up")
+                ));
+            }
+            container::State::Running => {
+                if container::resolves_inside(&entry, &fqdn) == Some(false) {
+                    println!();
+                    lifecycle::explain_dns_wait(&fqdn);
+                }
+            }
+        }
+    }
 }
 
 /// Print every way into the cluster from macOS.

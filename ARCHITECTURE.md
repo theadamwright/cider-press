@@ -213,17 +213,33 @@ node that will not boot. Each element must be its own SQL value:
 `SET x = 'a', 'b'`. The entrypoint does this, then **verifies by restarting**
 and rolls back if the server does not come up.
 
-**5. Container DNS registration is asynchronous, and occasionally slow.** A
-container's `<name>.<domain>` record normally appears in well under a second,
-but it has been observed not to land for over a minute. A node that cannot
-resolve *its own* name cannot start Postgres, because that name is in
-`listen_addresses`. Two mitigations, because this produced the worst failure
-this tool has had — `up` died pointing at `cider doctor`, and `doctor` then
-correctly reported DNS as healthy, sending you to look in the wrong place:
-the entrypoint waits generously (`PGD_SELF_RESOLVE_TIMEOUT`, 180s) and
-distinguishes "not configured" from "did not register in time" by checking
-whether the domain is in `resolv.conf`; and `up` restarts a failed node once
-(`NODE_ATTEMPTS`), which is what a human would do anyway.
+**5. Container DNS registration is asynchronous, and often slow.** A
+container's `<name>.<domain>` record can appear in well under a second, but
+after a container starts — created *or* restarted — it frequently takes 60–80
+seconds, and has been seen on several consecutive starts. During that window
+the name does not resolve at all: peers log `could not translate host name`, and
+a node that cannot resolve *its own* name cannot start Postgres, because that
+name is in `listen_addresses`. This is what "Unreachable for a minute after a
+restart" and "one node slow during `up`" both are.
+
+Three mitigations, because this produced the worst failure this tool has had —
+`up` died pointing at `cider doctor`, and `doctor` then correctly reported DNS
+as healthy, sending you to look in the wrong place: the entrypoint waits
+generously (`PGD_SELF_RESOLVE_TIMEOUT`, 180s) and distinguishes "not
+configured" from "did not register in time" by checking whether the domain is
+in `resolv.conf`; `up` restarts a failed node once (`NODE_ATTEMPTS`), which is
+what a human would do anyway; and `up` and `status` detect the missing name
+(`container::resolves_inside`) and say so, rather than print dots or an
+unexplained `Unreachable`.
+
+Ruled out, so nobody chases it again: a restarted container *does* get new
+addresses (a new random MAC, so a new IPv6 address, and the next IPv4 in
+sequence), and DNS serves the old ones for 6–20 seconds. But pinning the MAC
+(`--network default,mac=...`) kept IPv6 identical across restarts without
+shortening the window at all. The delay is the name being absent, not stale.
+A possible real fix, not yet tried: with pinned MACs the IPv6 addresses are
+predictable, so peers could be written into each node's `/etc/hosts` and the
+runtime's DNS bypassed between nodes.
 
 **6. The resolver file is `containerization.<domain>`,** not `<domain>`. Never
 look for it by path — ask `container system dns list`.

@@ -753,10 +753,26 @@ This only affects installs from Homebrew. The signed `.pkg` puts `container` in
 with a different domain (often `test`). Either set `CIDER_DOMAIN=test` in `.env`
 and keep yours, or run `cider bootstrap` to switch — it backs your config up first.
 
-**A node hangs at "waiting for host-2".** `cider pgd up` prints the last 40 log lines
-on timeout. Usually name resolution: `cider pgd shell 1`, then
-`getent hosts host-2.cider`. Nothing back means the DNS domain isn't in effect —
-`container system stop && container system start`, then `cider doctor`.
+**A node waits a minute or more at "waiting for host-2", or shows `Unreachable`
+after `start`.** Usually the runtime, not the node. After a container starts,
+whether `up` created it or `start` restarted it, Apple's `container` sometimes
+takes a minute or two to register its name in DNS; 60–80 seconds is typical when
+it happens, and it happens often. Until then the node can't start Postgres (it
+waits for its own name) and its peers can't reach it. Both `up` and `status` tell
+you when this is what's going on:
+
+```
+  ! host-2.cider is not in the runtime's DNS yet
+```
+
+There's nothing to do but wait. The node starts, and its peers find it, as soon
+as the name appears. (If `status` instead says the container is stopped, run
+`cider pgd start`.)
+
+If the name still hasn't appeared after three minutes, the node gives up and
+`up` prints its last 40 log lines. Then the DNS domain may not be in effect:
+`cider pgd shell 1`, then `getent hosts host-2.cider`. If nothing comes back,
+run `container system stop && container system start`, then `cider doctor`.
 
 **A join failed and left a mess.** The entrypoint discards a half-initialised
 `PGDATA` rather than leaving something that looks provisioned but isn't, so
