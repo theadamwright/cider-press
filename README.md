@@ -6,7 +6,7 @@
                     \        /            |~~~~~~~|
                      '-.__.-'             '._____.'
 
-                  p g d - c i d e r
+                c i d e r - p r e s s
         three nodes of EDB Postgres Distributed,
           pressed on Apple's container runtime
 ```
@@ -60,13 +60,22 @@ or [Hybrid Manager](https://www.enterprisedb.com/docs/pgd/latest/deploying/deplo
 
 ## Could this do more than PGD?
 
-Structurally, yes. Commands are grouped as `cider <product> <verb>`, and the
-verbs are written to be product-agnostic — so a second stack would be a new
-group reusing the same grammar (`cider efm up`, `cider patroni status`) rather
-than a rewrite.
+Structurally, yes. Commands are grouped as `cider <product> <verb>`, and most
+verbs are product-agnostic — so a second stack would be a new group reusing the
+same grammar (`cider efm up`, `cider patroni status`) rather than a rewrite. The
+lifecycle code underneath (start, wait, retry, stop, tear down) would need to be
+shared first; [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-second-product) has the
+plan.
 
-Two candidates, neither built and neither promised:
+Three candidates, none built and none promised:
 
+- **Core PostgreSQL logical replication** — two community PostgreSQL nodes from
+  the [PGDG](https://www.postgresql.org/download/linux/debian/) repository with
+  `wal_level = logical`, ready for you to create a publication and a
+  subscription in each direction (`origin = none`, PostgreSQL 16+). A reference
+  point for what's built into core Postgres, with conflicts, DDL and sequences
+  left to you. The likeliest next addition, and the only one that would need no
+  EDB subscription.
 - **[EDB Failover Manager](https://www.enterprisedb.com/docs/efm/latest/)** —
   streaming replication with automatic failover, the classic counterpart to
   PGD's active-active. Evaluated as far as feasibility: `edb-efm54` is published

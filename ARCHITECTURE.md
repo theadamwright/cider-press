@@ -31,7 +31,7 @@ If you're new to this, roughly an hour in this order:
    join, then configure. This is where the PGD knowledge lives.
 5. **`src/cluster.rs`** — the verbs. Start at `up()` and follow it down.
 
-Then come back to *Five things that will bite you* below, which will make a lot
+Then come back to *Six things that will bite you* below, which will make a lot
 more sense once you've seen the moving parts.
 
 ## Module map
@@ -58,21 +58,76 @@ setup (`doctor`, `bootstrap`, which touch your Mac's DNS configuration) from
 cluster work, and it leaves room to add a second product without a breaking
 rename of every command.
 
-Two candidates have been considered, neither built:
+Three candidates have been considered, none built:
 
+- **Core PostgreSQL logical replication** — two PGDG nodes with
+  `wal_level = logical`, left for the user to wire up with a publication and a
+  subscription in each direction. The simplest of the three, and the only one
+  that needs no subscription token. It is the worked example in the next
+  section.
 - **EFM** is viable. `edb-efm54` is published for Debian 12 arm64, and a Virtual
   IP works on this runtime (`--cap-add NET_ADMIN`; vmnet routes an address it did
   not assign, verified from both the host and a peer container). EFM's
   `primary.health.check.port` — 200 on the primary, 404 elsewhere — is probably a
   better fit for a lab than a VIP.
-- **Patroni** popular open source project for managing streaming replication, 
+- **Patroni** — the popular open-source manager for streaming replication, with
+  etcd for consensus.
 
-Either would mean a new `Top::<Product>(Verb)` arm reusing the existing verbs,
-plus its own image and entrypoint. The verbs are deliberately generic for that
-reason; `ui` is the only PGD-specific one, and a second product would reject it.
+### Adding a second product
 
-Note that a second product needs its own **port base**. PGD occupies 5432-5434
-and 6432-6457 on loopback today, and two stacks running at once would collide.
+The command grammar is ready for a second product. The code is about half
+ready. Here is what carries over, measured against the logical-replication
+pair:
+
+| Piece | Reusable? |
+|---|---|
+| `container.rs`, `bootstrap.rs`, `term.rs` | As-is. PGD appears only in comments, one "Next:" hint and the banner tagline. |
+| `doctor.rs` | Mostly. The token and image checks assume PGD's image. |
+| `config.rs` | Needs splitting. Domain, sizing, credentials and the naming helpers are shared. Group, pool mode, monitor, Connection Manager ports and the token belong to PGD. |
+| `cluster.rs` lifecycle: `stop_node`, `first_running`, `wait_for_node`, `start_and_wait`, `stop`, `start`, `down`, `pomace`, `containers_table` | In shape, yes. But they read PGD's `Config` and hard-code `cider pgd` in their messages. |
+| `cluster.rs`: `build`, `up`, `start_node` | Half. The skeleton is shared. The token secret, the Connection Manager and monitor ports, the `PGD_*` env and the post-join steps are not. |
+| `cluster.rs`: `node_joined`, `endpoints`, `ui`, pool mode, `pg_stat_statements`, the Connection Manager wait | PGD only. |
+| `state.rs`, `monitor.rs` | PGD only, and should stay that way. |
+| `Verb` | Not quite. `ui`, `pour` and `cli` belong to PGD; the rest are generic. |
+| `image/entrypoint.sh` | About a third: the privilege drop, the self-resolve wait, `pg_hba` and `listen_addresses`. |
+
+The alternative, copying the lifecycle into a second module, is the wrong
+trade. The stop signal, the retry and the `pomace` confirmation each exist
+because of a failure that took a debugging session to find. Two copies would
+drift, and the drift would show up as the kind of bug this tool is meant to
+avoid. So the order is refactor first, then add the product:
+
+1. **Move the lifecycle out of `cluster.rs`** into a module that takes a small
+   per-product description: container prefix, volume prefix, image, node
+   count, port base, and the `cider <group>` name used in messages. The
+   readiness check is passed in as a closure. Don't use a trait yet; two
+   implementations don't justify one, though a third might. PGD's behaviour
+   must not change, and CI can't prove that, so this step ends with a cold
+   `pomace -y && build && up`.
+2. **Split `Config`** into the settings the host shares and the ones each
+   product owns.
+3. **Split `Verb`** into shared verbs plus per-product ones, using clap's
+   `#[command(flatten)]`, so `cider logical --help` doesn't offer a web UI.
+4. **Move the shared entrypoint helpers into one file that both images
+   source**, so a fix to the `pg_hba` or listen logic lands once. The build
+   context is already `image/`, so a second Dockerfile can sit beside the
+   first.
+
+After that comes the product itself: its own Dockerfile, entrypoint and module.
+
+A second product must not share these with PGD, or the two can't run at the
+same time: the container prefix (`host-`), the volume prefix, the image tag and
+the loopback ports. PGD occupies 5432-5434 and 6432-6457 today. The
+logical-replication pair is decided as `cider logical`, with containers named
+`dolores-1` and `dolores-2`.
+
+Of the six things below, a logical-replication pair still hits **#1**. A
+subscription's `CONNECTION` string is stored in the catalog and resolved again
+on every reconnect, so it needs the fully-qualified name for the same reason
+PGD's `--listen-addr` does. It also hits **#2**, because a subscription that
+connects over IPv6 needs the `::/0` line. It mostly avoids **#3** and **#5**:
+if `listen_addresses` is `'*'` from the first start, nothing needs to resolve
+the node's own name at boot.
 
 ## Why Debian 12, and why the version is pinned
 
