@@ -505,13 +505,13 @@ CREATE PUBLICATION pp FOR TABLE pingpong;
 
 -- on dolores-1 (./cider logical psql 1)
 CREATE SUBSCRIPTION from_dolores_2
-  CONNECTION 'host=dolores-2.cider dbname=demo'
+  CONNECTION 'host=dolores-2.cider dbname=demo tcp_user_timeout=5000'
   PUBLICATION pp
   WITH (origin = none, copy_data = false);
 
 -- on dolores-2 (./cider logical psql 2)
 CREATE SUBSCRIPTION from_dolores_1
-  CONNECTION 'host=dolores-1.cider dbname=demo'
+  CONNECTION 'host=dolores-1.cider dbname=demo tcp_user_timeout=5000'
   PUBLICATION pp
   WITH (origin = none, copy_data = false);
 ```
@@ -526,10 +526,8 @@ Paste each part into `./cider logical psql 1` and `./cider logical psql 2`. Then
 ```
 
 A row inserted on either node now appears on the other. It keeps doing so across
-`./cider logical stop` and `start`, but not straight away: after a restart each
-subscription retries every few seconds until it can reach its peer, and that can
-take a minute or two while the runtime registers the nodes' names in DNS (see
-[Troubleshooting](#troubleshooting)).
+`./cider logical stop` and `start`: after a restart each subscription reconnects
+to its peer by itself, within about 10 seconds.
 
 The apply-error count in `status` is PostgreSQL's own
 (`pg_stat_subscription_stats.apply_error_count`). It counts *every* error the
@@ -545,6 +543,12 @@ Why the SQL looks the way it does:
 - **The fully-qualified name** in `CONNECTION`. It's stored, and resolved again on
   every reconnect, so it needs the name that always resolves; see
   [the DNS part](#the-dns-part-the-only-genuinely-tricky-bit).
+- **`tcp_user_timeout=5000`** makes a connection attempt to the peer give up
+  after 5 seconds and try again. Without it, restarting both nodes regularly
+  left a subscription's first attempt hanging for about two minutes (the
+  kernel's TCP connect timeout) before it retried. `connect_timeout` doesn't
+  help here: subscriptions connect in a way that ignores it. PGD sets the same
+  option on its own connections.
 - **No password.** Each node's server inherits the lab password from its
   environment, and a superuser's subscription can use it. A non-superuser's
   subscription must put `password=` in the connection string.
@@ -707,6 +711,15 @@ Two consequences:
 - **`sudo container system dns create cider`** only affects *your Mac's*
   resolver, letting you `psql -h host-1.cider` from the host. The cluster works
   without it; the published `127.0.0.1` ports always work.
+- **Nodes don't wait for that DNS to find each other.** After a container
+  starts, the runtime often takes a minute or two to register its name, and
+  every restart used to leave nodes `Unreachable` for that long. Instead, each
+  container gets a fixed MAC address derived from its name, which makes its
+  IPv6 address the same on every start. Each node's entrypoint then writes every
+  node's name and IPv6 address into its own `/etc/hosts` when it starts, and
+  lookups check that file before DNS. A whole-cluster restart went from 17–85
+  seconds to 0–11. The runtime's DNS still serves your Mac, and is the fallback
+  if a node has no global IPv6 address.
 
 `listen_addresses` is also what Connection Manager and PGD Monitor bind to, which
 is why publishing their ports works at all.
@@ -901,23 +914,30 @@ with a different domain (often `test`). Either set `CIDER_DOMAIN=test` in `.env`
 and keep yours, or run `cider bootstrap` to switch — it backs your config up first.
 
 **A node waits a minute or more at "waiting for host-2", or shows `Unreachable`
-after `start`.** Usually the runtime, not the node. After a container starts,
-whether `up` created it or `start` restarted it, Apple's `container` sometimes
-takes a minute or two to register its name in DNS; 60–80 seconds is typical when
-it happens, and it happens often. Until then the node can't start Postgres (it
-waits for its own name) and its peers can't reach it. Both `up` and `status` tell
-you when this is what's going on:
+after `start`.** After a container starts, Apple's `container` often takes a
+minute or two to register its name in DNS. Nodes don't wait for that: every
+node is given a fixed MAC address, which fixes its IPv6 address, and each
+node's entrypoint writes every node's name and address into its own
+`/etc/hosts` at each start (see
+[the DNS part](#the-dns-part-the-only-genuinely-tricky-bit)). So a long wait
+usually means the containers were created by an older cider, before that
+existed. Both `up` and `status` say so when a node's name isn't resolving:
 
 ```
   ! host-2.cider is not in the runtime's DNS yet
 ```
 
-There's nothing to do but wait. The node starts, and its peers find it, as soon
-as the name appears. (If `status` instead says the container is stopped, run
-`cider pgd start`.)
+Recreate the containers to pick the fix up. This keeps your data, but the image
+needs the new entrypoint too, so rebuild it first:
 
-If the name still hasn't appeared after three minutes, the node gives up and
-`up` prints its last 40 log lines. Then the DNS domain may not be in effect:
+```bash
+./cider pgd build && ./cider pgd down && ./cider pgd up
+```
+
+If `status` instead says the container is stopped, run `cider pgd start`.
+
+If a name still doesn't resolve after three minutes, the node gives up and `up`
+prints its last 40 log lines. Then the DNS domain may not be in effect:
 `cider pgd shell 1`, then `getent hosts host-2.cider`. If nothing comes back,
 run `container system stop && container system start`, then `cider doctor`.
 

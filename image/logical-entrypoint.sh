@@ -27,6 +27,7 @@ CIDER_GROUP="logical"
 # ---------------------------------------------------------------------------
 if [ "$(id -u)" = "0" ]; then
     prepare_state_dirs
+    write_peer_hosts
     become_superuser "$@"
 fi
 
@@ -45,7 +46,6 @@ POSTGRES_USER="${POSTGRES_USER:-postgres}"
 # password= in the connection string.)
 export PGPASSWORD="${PGPASSWORD:-}"
 [ -n "$PGPASSWORD" ] || die "PGPASSWORD is required"
-
 log "node=${NODE_FQDN} pg=${PG_MAJOR} db=${POSTGRES_DB}"
 
 # --- Provision, once ---------------------------------------------------------

@@ -283,8 +283,10 @@ pub fn prepare_node(d: &Deployment, i: u16) -> Result<bool> {
 /// The `container run` flags every node gets, whatever runs inside it.
 ///
 /// The product appends its published ports, its environment and the image.
-/// `--dns-search` is here because every product's nodes find each other the
-/// same way: as `<host>.<domain>` through the runtime's DNS.
+/// `--dns-search` is here because every product's nodes address each other
+/// as `<host>.<domain>`. The fixed MAC and `CIDER_PEERS` are here because
+/// every product's nodes need those names to resolve the moment they start;
+/// see [`node_mac`] and [`peers_env`].
 pub fn base_run_args(cfg: &Config, d: &Deployment, i: u16) -> Vec<String> {
     vec![
         "run".into(),
@@ -295,11 +297,94 @@ pub fn base_run_args(cfg: &Config, d: &Deployment, i: u16) -> Vec<String> {
         cfg.cpus.clone(),
         "--memory".into(),
         cfg.memory.clone(),
+        "--network".into(),
+        format!("default,mac={}", node_mac(&d.host_name(i))),
         "--dns-search".into(),
         cfg.domain.clone(),
+        "--env".into(),
+        format!("CIDER_PEERS={}", peers_env(d)),
         "--volume".into(),
         format!("{}:{NODE_STATE_DIR}", d.volume_name(i)),
     ]
+}
+
+// --- stable addresses ------------------------------------------------------
+//
+// The runtime's DNS often takes a minute or more to register a container's
+// name after it starts (ARCHITECTURE.md, bite #5). Nodes therefore do not
+// rely on it to find each other. Instead:
+//
+//   1. Every container gets a fixed MAC, derived from its name.
+//   2. Its IPv6 address is the network's /64 prefix plus an interface ID
+//      derived from that MAC (EUI-64), so it is the same on every start.
+//   3. Every node is told every node's name and interface ID (CIDER_PEERS),
+//      and its entrypoint writes `<prefix>:<id> <name>` into /etc/hosts at
+//      each start, using its own current prefix.
+//
+// Name lookup checks /etc/hosts before DNS, so peers resolve at once. The
+// prefix is read inside the container rather than passed in, so if the
+// runtime ever hands the network a new prefix, the next start picks it up.
+// IPv4 is not used for this: the runtime allocates it in sequence and it
+// changes on every start whatever the MAC.
+
+/// A fixed MAC address for a container, derived from its name.
+///
+/// Without one, the runtime gives a container a new random MAC on every
+/// start, and with it a new IPv6 address.
+///
+/// Derived from the *name*, not the node number, so two clusters running at
+/// once (say a scratch cluster beside yours) never share a MAC. The leading
+/// `02` marks it locally administered, so it cannot match real hardware.
+pub fn node_mac(container_name: &str) -> String {
+    let b = mac_bytes(container_name);
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5]
+    )
+}
+
+fn mac_bytes(container_name: &str) -> [u8; 6] {
+    // FNV-1a, 64-bit. Hand-rolled because std's hasher is not promised to
+    // give the same answer across Rust releases, and a MAC should not change
+    // because the compiler did.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in container_name.bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let b = h.to_be_bytes();
+    [0x02, b[3], b[4], b[5], b[6], b[7]]
+}
+
+/// The low 64 bits of a container's IPv6 address, from its MAC, as four
+/// groups: "0074:56ff:fe18:cc15".
+///
+/// This is modified EUI-64 (RFC 4291, appendix A), which is how the
+/// runtime's network forms addresses: flip the universal/local bit of the
+/// first octet, and put ff:fe between the two halves of the MAC.
+pub fn interface_id(container_name: &str) -> String {
+    eui64(mac_bytes(container_name))
+}
+
+fn eui64(m: [u8; 6]) -> String {
+    format!(
+        "{:02x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
+        m[0] ^ 0x02,
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
+    )
+}
+
+/// `CIDER_PEERS` for this deployment: every node, itself included, as
+/// `<fqdn>=<interface id>`, comma-separated. The same list for every node.
+pub fn peers_env(d: &Deployment) -> String {
+    (1..=d.nodes)
+        .map(|i| format!("{}={}", d.host_fqdn(i), interface_id(&d.host_name(i))))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Block until `ready` says node `i` is ready, or fail with its logs.
@@ -653,6 +738,61 @@ mod tests {
             rows.iter()
                 .all(|r| !r.contains("dolores") && !r.contains("host-10"))
         );
+    }
+
+    // Both values observed on real containers on this runtime, so these test
+    // the derivation against the network's actual behaviour, not against
+    // itself.
+    #[test]
+    fn interface_ids_match_what_the_runtime_assigns() {
+        // A hand-picked MAC: the container came up as fd68:…:c1:deff:fe00:1.
+        assert_eq!(
+            eui64([0x02, 0xc1, 0xde, 0x00, 0x00, 0x01]),
+            "00c1:deff:fe00:0001"
+        );
+        // host-1's derived MAC: it came up as fd68:…:74:56ff:fe18:cc15.
+        assert_eq!(node_mac("host-1"), "02:74:56:18:cc:15");
+        assert_eq!(interface_id("host-1"), "0074:56ff:fe18:cc15");
+    }
+
+    #[test]
+    fn node_macs_are_distinct_locally_administered_unicast() {
+        let names = [
+            "host-1",
+            "host-2",
+            "host-3",
+            "scratch-1",
+            "dolores-1",
+            "dolores-2",
+        ];
+        let macs: std::collections::HashSet<_> = names.iter().map(|n| node_mac(n)).collect();
+        assert_eq!(macs.len(), names.len(), "two names share a MAC");
+        for name in names {
+            let first = mac_bytes(name)[0];
+            assert_eq!(first & 0b01, 0, "{name}: must be unicast");
+            assert_eq!(first & 0b10, 0b10, "{name}: must be locally administered");
+        }
+    }
+
+    #[test]
+    fn peers_list_every_node_including_itself() {
+        assert_eq!(
+            peers_env(&pgd_like()),
+            format!(
+                "host-1.cider={},host-2.cider={},host-3.cider={}",
+                interface_id("host-1"),
+                interface_id("host-2"),
+                interface_id("host-3")
+            )
+        );
+    }
+
+    #[test]
+    fn every_node_gets_its_fixed_mac_and_the_peer_list() {
+        let args = base_run_args(&Config::load(), &pgd_like(), 2);
+        let pos = args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(args[pos + 1], format!("default,mac={}", node_mac("host-2")));
+        assert!(args.contains(&format!("CIDER_PEERS={}", peers_env(&pgd_like()))));
     }
 
     #[test]

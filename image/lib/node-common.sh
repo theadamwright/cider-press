@@ -33,6 +33,53 @@ prepare_state_dirs() {
     chown -R "$PG_SUPERUSER":"$PG_SUPERUSER" "$CIDER_STATE_DIR"
 }
 
+# Pin every node's name to its stable IPv6 address in /etc/hosts. Root only;
+# call on every start, before anything resolves a peer.
+#
+# The runtime's DNS often takes a minute or more to register a container's name
+# after it starts (ARCHITECTURE.md, bite #5), so nodes do not wait for it.
+# cider gives each container a fixed MAC, which fixes the low 64 bits of its
+# IPv6 address, and passes every node's name and those bits in CIDER_PEERS:
+#   host-1.cider=0074:56ff:fe18:cc15,host-2.cider=...
+# This adds the network's /64 prefix, read from this container's own address,
+# and writes the result. Name lookup checks /etc/hosts before DNS, so every
+# peer resolves at once. Reading the prefix here, rather than being told it,
+# means a new prefix from the runtime is picked up on the next start.
+#
+# Every start, because the runtime rewrites /etc/hosts on each start. Without
+# CIDER_PEERS (an older cider) it does nothing, and the runtime's DNS is used as
+# before.
+write_peer_hosts() {
+    [ -n "${CIDER_PEERS:-}" ] || return 0
+
+    # This container's global IPv6 address, as 32 hex digits. Normally present
+    # by now; SLAAC can take a moment, so wait up to five seconds.
+    local hex="" tries=0
+    while [ -z "$hex" ] && [ "$tries" -lt 50 ]; do
+        hex="$(awk '$4 == "00" && $6 != "lo" {print $1; exit}' /proc/net/if_inet6 2>/dev/null)"
+        [ -n "$hex" ] || { sleep 0.1; tries=$(( tries + 1 )); }
+    done
+    if [ -z "$hex" ]; then
+        log "no global IPv6 address; peers will be resolved through the runtime's DNS"
+        return 0
+    fi
+    local prefix="${hex:0:4}:${hex:4:4}:${hex:8:4}:${hex:12:4}"
+
+    # Replace, never append twice: keep the runtime's own lines, drop any of
+    # ours from an earlier start, then add the current set.
+    local tmp="/etc/hosts.cider-press" entry count=0
+    grep -v '# cider-press$' /etc/hosts > "$tmp" || true
+    for entry in ${CIDER_PEERS//,/ }; do
+        printf '%s:%s\t%s\t# cider-press\n' "$prefix" "${entry#*=}" "${entry%%=*}" >> "$tmp"
+        count=$(( count + 1 ))
+    done
+    # Copied over rather than moved: the file keeps its inode, in case the
+    # runtime is watching it.
+    cat "$tmp" > /etc/hosts
+    rm -f "$tmp"
+    log "pinned ${count} node names to their IPv6 addresses (${prefix}::/64) in /etc/hosts"
+}
+
 # Re-exec the calling entrypoint as the Postgres superuser. Call as
 #   become_superuser "$@"
 # with the entrypoint's own arguments. Does not return.

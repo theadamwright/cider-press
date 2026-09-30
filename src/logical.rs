@@ -387,7 +387,15 @@ fn subscription_name(d: &Deployment, from: u16) -> String {
 ///
 /// `origin = none` (PostgreSQL 16+) is what makes two-way replication safe to
 /// set up: without it each node would send the other's changes straight back.
-/// `copy_data = false` because both tables start empty. What this does *not*
+/// `copy_data = false` because both tables start empty.
+///
+/// `tcp_user_timeout=5000` makes a connection attempt to the peer give up
+/// after 5s and retry. Without it, restarting both nodes regularly left a
+/// subscription's first attempt hanging for the kernel's full SYN-retry time,
+/// about 127s, before it tried again: measured at 136s against 7-8s with it.
+/// `connect_timeout` would not help; the apply worker connects with libpq's
+/// asynchronous API, which leaves that timeout to the caller. PGD's own
+/// connection strings set `tcp_user_timeout` for the same reason. What this does *not*
 /// do is resolve conflicts, replicate DDL or keep sequences in step — those
 /// are left to you, and a primary key inserted on both nodes is the quickest
 /// way to see it.
@@ -404,7 +412,7 @@ fn wiring_sql(d: &Deployment, db: &str) -> String {
         sql.push_str(&format!(
             "\n-- on {} (./cider logical psql {i})\n\
              CREATE SUBSCRIPTION {}\n  \
-             CONNECTION 'host={} dbname={db}'\n  \
+             CONNECTION 'host={} dbname={db} tcp_user_timeout=5000'\n  \
              PUBLICATION pp\n  \
              WITH (origin = none, copy_data = false);\n",
             d.host_name(i),
@@ -450,12 +458,12 @@ mod tests {
         assert!(sql.contains(
             "-- on dolores-1 (./cider logical psql 1)\n\
              CREATE SUBSCRIPTION from_dolores_2\n  \
-             CONNECTION 'host=dolores-2.cider dbname=demo'"
+             CONNECTION 'host=dolores-2.cider dbname=demo tcp_user_timeout=5000'"
         ));
         assert!(sql.contains(
             "-- on dolores-2 (./cider logical psql 2)\n\
              CREATE SUBSCRIPTION from_dolores_1\n  \
-             CONNECTION 'host=dolores-1.cider dbname=demo'"
+             CONNECTION 'host=dolores-1.cider dbname=demo tcp_user_timeout=5000'"
         ));
         assert_eq!(sql.matches("origin = none, copy_data = false").count(), 2);
     }

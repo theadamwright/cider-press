@@ -44,7 +44,7 @@ If PGD is more than you want to take in at once, read `src/logical.rs` and
 `image/logical-entrypoint.sh` first instead. They're the same shape with no
 cluster to join, so the lifecycle is easier to see.
 
-Then come back to *Six things that will bite you* below, which will make a lot
+Then come back to *Seven things that will bite you* below, which will make a lot
 more sense once you've seen the moving parts.
 
 ## Module map
@@ -159,7 +159,7 @@ uses `host-1..3`, image `cider-press:latest`, and ports 5432-5434 and 6432-6457.
 ports 5442-5443. Volume names include the container name, so a shared volume
 prefix is fine.
 
-Of the six things below, the logical pair still hits **#1**. A subscription's
+Of the seven things below, the logical pair still hits **#1**. A subscription's
 `CONNECTION` string is stored in the catalog and resolved again on every
 reconnect, so it needs the fully-qualified name for the same reason PGD's
 `--listen-addr` does. It also hits **#2**, because a subscription that connects
@@ -201,7 +201,7 @@ logical image the early test of `lib/node-common.sh` on Debian 13, so when PGD
 moves, the library will already be proven there. The cost, until PGD moves too,
 is that a change to the library has to be checked on both Debian 12 and 13.
 
-## Six things that will bite you
+## Seven things that will bite you
 
 These each cost a debugging session. They are not in any documentation, and
 every one of them produced a cluster that looked fine and wasn't.
@@ -252,17 +252,45 @@ what a human would do anyway; and `up` and `status` detect the missing name
 (`container::resolves_inside`) and say so, rather than print dots or an
 unexplained `Unreachable`.
 
-Ruled out, so nobody chases it again: a restarted container *does* get new
-addresses (a new random MAC, so a new IPv6 address, and the next IPv4 in
-sequence), and DNS serves the old ones for 6–20 seconds. But pinning the MAC
-(`--network default,mac=...`) kept IPv6 identical across restarts without
-shortening the window at all. The delay is the name being absent, not stale.
-A possible real fix, not yet tried: with pinned MACs the IPv6 addresses are
-predictable, so peers could be written into each node's `/etc/hosts` and the
-runtime's DNS bypassed between nodes.
+**The fix is to not depend on it between nodes.** A restarted container gets a
+new random MAC, so a new IPv6 address, and the next IPv4 in sequence. Pinning
+the MAC (`--network default,mac=…`, derived from the container's name in
+`lifecycle::node_mac`) makes the IPv6 address the same on every start: the
+network's /64 prefix plus the MAC's EUI-64 interface ID. Pinning alone did not
+help (restarts still took 6–85s), because the delay is the name being *absent*,
+not stale. So `cider` also passes every node the name and interface ID of every
+node (`CIDER_PEERS`). At each start, as root, `write_peer_hosts` in
+`lib/node-common.sh` adds its own current prefix and writes the lot into
+`/etc/hosts`; name lookup checks that before DNS. Every start, because the
+runtime rewrites `/etc/hosts` on each one. The prefix is read inside the
+container rather than passed in, so a new prefix from the runtime is picked up
+on the next start.
+
+Measured on a scratch PGD cluster: whole-cluster restarts went from 77, 17, 6,
+85 and 78 seconds to 0, 11 and 6, with no `Unreachable` at all. Recreating
+containers with `down` and `up` went from 65–70 seconds per node to about 3.
+Not one DNS lookup failure was logged. The runtime's DNS still serves macOS,
+and is the fallback for a container with no global IPv6 address, or one created
+by an older cider without `CIDER_PEERS`. That fallback is why the
+`resolves_inside` notes above remain.
 
 **6. The resolver file is `containerization.<domain>`,** not `<domain>`. Never
 look for it by path — ask `container system dns list`.
+
+**7. A connection attempt to a peer that just restarted can hang for two
+minutes.** Found only once DNS stopped hiding it. When both logical nodes
+restarted together, a subscription's first attempt to reach its peer was often
+dropped, and with nothing to stop it libpq waited out the kernel's SYN retries
+(`tcp_syn_retries = 6`, about 127 seconds) before trying again. Restarts took
+136–137 seconds. `connect_timeout` does not help: the apply worker connects
+with libpq's asynchronous API, which leaves that timeout to the caller, and
+`PGCONNECT_TIMEOUT` was tried and made no difference. Nor can the container
+lower `tcp_syn_retries`, because `/proc/sys` is read-only and `container run`
+has no `--sysctl`. What works is `tcp_user_timeout=5000` in the connection
+string, a socket option the kernel enforces whatever API is used. With it,
+restarts took 7–8 seconds. PGD's own node connection strings already set
+`tcp_user_timeout`, which is why PGD never showed this. Any new product whose
+nodes connect to each other through libpq should set it too.
 
 ## Deliberate decisions
 

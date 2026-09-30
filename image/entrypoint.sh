@@ -34,6 +34,7 @@ CIDER_GROUP="pgd"
 if [ "$(id -u)" = "0" ]; then
     prepare_state_dirs
     install -d -o "$PG_SUPERUSER" -g "$PG_SUPERUSER" -m 0750 /etc/edb/pgd-cli
+    write_peer_hosts
     become_superuser "$@"
 fi
 
