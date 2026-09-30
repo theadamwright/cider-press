@@ -7,8 +7,8 @@
                      '-.__.-'             '._____.'
 
                 c i d e r - p r e s s
-        three nodes of EDB Postgres Distributed,
-          pressed on Apple's container runtime
+         Postgres hosts, built to be broken,
+         pressed on Apple's container runtime
 ```
 
 A from-scratch local lab for **EDB Postgres Distributed 6.5.0+** on Apple silicon,
