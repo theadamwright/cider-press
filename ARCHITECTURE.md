@@ -29,7 +29,9 @@ If you're new to this, roughly an hour in this order:
    trips people up.
 4. **`image/entrypoint.sh`** — what actually happens inside a node: provision or
    join, then configure. This is where the PGD knowledge lives.
-5. **`src/cluster.rs`** — the verbs. Start at `up()` and follow it down.
+5. **`src/cluster.rs`** — PGD's verbs. Start at `up()` and follow it down; the
+   shared parts it calls into (start-and-wait, retry, stop) are in
+   `src/lifecycle.rs`.
 
 Then come back to *Six things that will bite you* below, which will make a lot
 more sense once you've seen the moving parts.
@@ -42,13 +44,15 @@ more sense once you've seen the moving parts.
 | `container.rs` | **The only** module that runs `container` or parses its output. If the runtime changes its CLI, this is the blast radius. |
 | `doctor.rs` | Preflight checks, ordered so the first failure is the root cause. |
 | `bootstrap.rs` | One-time host setup: the container DNS domain, the macOS resolver. Edits a file the user owns, so it backs up and verifies. |
-| `cluster.rs` | The verbs: build, up, status, endpoints, ui, lifecycle, teardown. |
+| `lifecycle.rs` | What every product shares: build the image, start a node and wait for it (with the retry), stop, start, down, `pomace`. Knows nothing about what runs inside a node; a product describes its nodes with a `Deployment` and passes in how to create one and how to tell it is ready. |
+| `cluster.rs` | PGD's half: its container flags and environment, join readiness, pooling, `pg_stat_statements`, status, endpoints, the web UI. |
 | `state.rs` | Live cluster state via the `pgd` CLI's JSON output. |
 | `monitor.rs` | PGD Monitor probes (the web UI added in PGD 6.5). |
 | `term.rs` | Colour, glyphs, banner. |
 
 Adding a verb means: an arm on `Verb` in `main.rs`, and a function in
-`cluster.rs`. Nothing else.
+`lifecycle.rs` if every product would do the same thing, or in `cluster.rs` if
+it is PGD's own. Nothing else.
 
 ### Why commands are grouped under `pgd`
 
@@ -84,8 +88,8 @@ pair:
 | `container.rs`, `bootstrap.rs`, `term.rs` | As-is. PGD appears only in comments, one "Next:" hint and the banner tagline. |
 | `doctor.rs` | Mostly. The token and image checks assume PGD's image. |
 | `config.rs` | Needs splitting. Domain, sizing, credentials and the naming helpers are shared. Group, pool mode, monitor, Connection Manager ports and the token belong to PGD. |
-| `cluster.rs` lifecycle: `stop_node`, `first_running`, `wait_for_node`, `start_and_wait`, `stop`, `start`, `down`, `pomace`, `containers_table` | In shape, yes. But they read PGD's `Config` and hard-code `cider pgd` in their messages. |
-| `cluster.rs`: `build`, `up`, `start_node` | Half. The skeleton is shared. The token secret, the Connection Manager and monitor ports, the `PGD_*` env and the post-join steps are not. |
+| `lifecycle.rs` | Yes: step 1 below, done. Start-and-wait with the retry, stop, start, down, `pomace`, the container table, the build skeleton and the base `container run` flags. |
+| `cluster.rs`: `build`, `up`, `start_node` | PGD's remaining half: the token secret, the Connection Manager and monitor ports, the `PGD_*` env and the post-join steps. |
 | `cluster.rs`: `node_joined`, `endpoints`, `ui`, pool mode, `pg_stat_statements`, the Connection Manager wait | PGD only. |
 | `state.rs`, `monitor.rs` | PGD only, and should stay that way. |
 | `Verb` | Not quite. `ui`, `pour` and `cli` belong to PGD; the rest are generic. |
@@ -97,13 +101,15 @@ because of a failure that took a debugging session to find. Two copies would
 drift, and the drift would show up as the kind of bug this tool is meant to
 avoid. So the order is refactor first, then add the product:
 
-1. **Move the lifecycle out of `cluster.rs`** into a module that takes a small
-   per-product description: container prefix, volume prefix, image, node
-   count, port base, and the `cider <group>` name used in messages. The
-   readiness check is passed in as a closure. Don't use a trait yet; two
-   implementations don't justify one, though a third might. PGD's behaviour
-   must not change, and CI can't prove that, so this step ends with a cold
-   `pomace -y && build && up`.
+1. **Move the lifecycle out of `cluster.rs`** *(done)* into `lifecycle.rs`,
+   which takes a small per-product `Deployment`: container prefix, volume
+   prefix, image, node count, Dockerfile, ready timeout, and the
+   `cider <group>` name used in messages. How to create a node and how to tell
+   it is ready are passed in as closures. There's no trait yet; two
+   implementations don't justify one, though a third might. Ports are not in
+   `Deployment`: only the product publishes them, so the port base stays the
+   product's to choose. PGD's behaviour must not change, and CI can't prove
+   that, so the refactor ends with a cold `pomace -y && build && up`.
 2. **Split `Config`** into the settings the host shares and the ones each
    product owns.
 3. **Split `Verb`** into shared verbs plus per-product ones, using clap's

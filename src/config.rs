@@ -163,7 +163,7 @@ impl Config {
     // everywhere PGD is concerned.
     /// Container name for node `i`, e.g. "host-1".
     pub fn host_name(&self, i: u16) -> String {
-        format!("{}{i}", self.host_prefix)
+        container_name(&self.host_prefix, i)
     }
     /// Fully-qualified name PGD nodes dial each other on, e.g. "host-1.cider".
     pub fn host_fqdn(&self, i: u16) -> String {
@@ -172,10 +172,6 @@ impl Config {
     /// PGD's own name for node `i`, e.g. "node-1".
     pub fn node_name(&self, i: u16) -> String {
         format!("{}{i}", self.node_prefix)
-    }
-    /// Named volume holding node `i`'s data directory.
-    pub fn volume_name(&self, i: u16) -> String {
-        format!("{}{}{i}", self.volume_prefix, self.host_prefix)
     }
 
     // --- published ports -------------------------------------------------------
@@ -295,6 +291,21 @@ fn exe_root() -> PathBuf {
         }
     }
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Container name for node `i`, e.g. "host-1".
+///
+/// The one place a container name is formed. Both `Config` and
+/// `lifecycle::Deployment` call it, so the code that creates a container and
+/// the code that later stops it cannot disagree about what it is called.
+pub fn container_name(host_prefix: &str, i: u16) -> String {
+    format!("{host_prefix}{i}")
+}
+
+/// Named volume for node `i`, e.g. "cider-press-host-1". Formed in one place
+/// for the same reason as [`container_name`].
+pub fn volume_name(volume_prefix: &str, host_prefix: &str, i: u16) -> String {
+    format!("{volume_prefix}{host_prefix}{i}")
 }
 
 /// Multi-host libpq URI over the given read-only ports.

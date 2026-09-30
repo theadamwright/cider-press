@@ -1,43 +1,42 @@
-//! Build the image, press a cluster, take it apart again.
+//! PGD: what is specific to pressing an EDB Postgres Distributed cluster.
+//!
+//! The shared lifecycle — start, wait, retry, stop, tear down — is in
+//! `lifecycle`. This module supplies PGD's half: how a node's container is
+//! created, how to tell it has joined, and everything that happens once the
+//! cluster exists (pooling, `pg_stat_statements`, Connection Manager, the web
+//! UI, the endpoints).
 
 use crate::config::{
     CM_HTTP_CONTAINER_PORT, CM_RO_CONTAINER_PORT, CM_RW_CONTAINER_PORT, Config,
     MONITOR_CONTAINER_PORT, PG_CONTAINER_PORT,
 };
-use crate::{bootstrap, container, monitor, state, term};
+use crate::lifecycle::{self, Deployment};
+use crate::{container, monitor, state, term};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
-/// How many times to start a node before giving up. Two, because the failure
-/// this guards against is a transient DNS-registration race that a restart
-/// clears; more attempts would just delay a real error.
-const NODE_ATTEMPTS: u32 = 2;
-
 /// How long to wait for Connection Manager after the last node joins. Short:
 /// this is a courtesy, not a health check, and `up` succeeds regardless.
 const CM_READY_TIMEOUT_SECS: u64 = 60;
 
-/// The signal that gives Postgres a *fast* shutdown.
+/// PGD's nodes, described for the shared lifecycle.
 ///
-/// Postgres reads SIGTERM, which is what `container stop` sends by default, as
-/// a smart shutdown that waits for every client to disconnect — and PGD nodes
-/// keep connections open to each other, so it waits forever and gets killed.
-/// See `container::stop_with_signal` for the whole story.
-const PG_STOP_SIGNAL: &str = "SIGINT";
-
-/// Grace period for a node to shut down before the runtime kills it. This is a
-/// ceiling: a clean shutdown of an idle node takes about a second.
-const PG_STOP_TIMEOUT_SECS: u64 = 60;
-
-/// Stop one node cleanly, so the next start does not pay crash recovery.
-///
-/// Every path that stops a node goes through here. Getting this wrong is not
-/// visible at the time — the container stops either way — and shows up later
-/// as a slow `up`, which is a long way from the cause.
-fn stop_node(name: &str) -> bool {
-    container::stop_with_signal(name, PG_STOP_SIGNAL, PG_STOP_TIMEOUT_SECS)
+/// Built from `Config` on every call rather than stored: it only borrows, so
+/// it costs nothing, and there is then no second copy of a setting to go
+/// stale.
+pub fn deployment(cfg: &Config) -> Deployment<'_> {
+    Deployment {
+        group: "pgd",
+        cluster_name: &cfg.cluster_name,
+        nodes: cfg.nodes,
+        host_prefix: &cfg.host_prefix,
+        volume_prefix: &cfg.volume_prefix,
+        image: &cfg.image,
+        dockerfile: "image/Dockerfile",
+        ready_timeout: cfg.ready_timeout,
+    }
 }
 
 // --- build -----------------------------------------------------------------
@@ -67,20 +66,9 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
     println!("  token    passed as a BuildKit secret, never stored in the image");
     println!();
 
-    let dockerfile = cfg.root.join("image/Dockerfile");
-    let context_dir = cfg.root.join("image");
-    if !dockerfile.exists() {
-        bail!("{} not found", dockerfile.display());
-    }
-
     // --secret ...,env=VAR reads straight from this process's environment, so
     // the token never touches disk and never lands in a layer or the history.
-    let mut args: Vec<String> = vec![
-        "build".into(),
-        "--file".into(),
-        dockerfile.display().to_string(),
-        "--tag".into(),
-        cfg.image.clone(),
+    let extra: Vec<String> = vec![
         "--secret".into(),
         "id=edb_token,env=EDB_SUBSCRIPTION_TOKEN".into(),
         "--build-arg".into(),
@@ -89,43 +77,18 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
         format!("PG_MAJOR={}", cfg.pg_major),
         "--build-arg".into(),
         format!("DEBIAN_VERSION={}", cfg.debian_version),
-        "--cpus".into(),
-        cfg.build_cpus.clone(),
-        "--memory".into(),
-        cfg.build_memory.clone(),
-        "--progress".into(),
-        "plain".into(),
     ];
-    if no_cache {
-        args.push("--no-cache".into());
-    }
-    args.push(context_dir.display().to_string());
-
-    if !container::run_streaming(&args)? {
-        bail!("build failed");
-    }
-    println!();
-    term::ok(&format!("built {}", cfg.image));
-    println!("Next: cider pgd up");
-    Ok(())
+    lifecycle::build_image(cfg, &deployment(cfg), &extra, no_cache)
 }
 
-/// Index of the first node whose container is running.
+/// Index of the first running node — the way in for anything that just needs
+/// *a* node.
 ///
-/// Anything that only needs *a* way into the cluster should enter through this
-/// rather than assuming node 1. Every node runs its own Connection Manager and
-/// every one of them routes to the current write leader, so entering through a
-/// surviving node is equivalent — and keeps working when node 1 is the one that
-/// went away, which is exactly when you reach for these commands.
+/// For PGD, entering through any node is equivalent: every node runs its own
+/// Connection Manager and every one of them routes to the current write
+/// leader.
 pub fn first_running(cfg: &Config) -> Result<u16> {
-    (1..=cfg.nodes)
-        .find(|&i| container::state(&cfg.host_name(i)) == container::State::Running)
-        .with_context(|| {
-            format!(
-                "no node of '{}' is running — run: cider pgd up",
-                cfg.cluster_name
-            )
-        })
+    lifecycle::first_running(&deployment(cfg))
 }
 
 // --- up --------------------------------------------------------------------
@@ -159,131 +122,24 @@ fn node_joined(cfg: &Config, container_name: &str, node_name: &str) -> bool {
     .is_some_and(|out| out.trim() == "1")
 }
 
-/// Block until a node has genuinely joined, or fail with its logs.
+/// Start node `i`: through the shared lifecycle if it already exists,
+/// otherwise by creating its container with PGD's ports and environment.
 ///
-/// Three outcomes matter and all three are handled: the container vanished,
-/// the container exited (its entrypoint gave up), or it is still running but
-/// not yet a cluster member. Only the last one is worth waiting on.
-fn wait_for_node(cfg: &Config, name: &str, node_name: &str) -> Result<()> {
-    print!("  waiting for {name} ");
-    std::io::stdout().flush().ok();
-    let mut waited = 0u64;
-    while waited < cfg.ready_timeout {
-        // A node whose entrypoint gave up leaves a *stopped* container, not an
-        // absent one, so both count as failure.
-        match container::state(name) {
-            container::State::Absent => {
-                println!();
-                bail!(
-                    "{name} disappeared. Last logs:\n{}",
-                    container::logs_tail(name, 30)
-                );
-            }
-            container::State::Stopped => {
-                println!();
-                bail!("{name} exited before joining the cluster");
-            }
-            container::State::Running => {}
-        }
-        if node_joined(cfg, name, node_name) {
-            println!(" {}", term::green("ready"));
-            return Ok(());
-        }
-        print!(".");
-        std::io::stdout().flush().ok();
-        sleep(Duration::from_secs(3));
-        waited += 3;
-    }
-    println!();
-    bail!("{name} did not become ready within {}s", cfg.ready_timeout)
-}
-
-/// Start a node and wait for it to join, retrying once if it fails.
-///
-/// The runtime registers a container in its DNS asynchronously, and that
-/// registration occasionally does not land before the entrypoint gives up. It
-/// is transient: restarting the same container almost always succeeds, which is
-/// exactly what a human would do next. Doing it automatically is the difference
-/// between a tool that works every time and one that works most times.
-///
-/// Retrying is safe because a node that fails this way never reached
-/// provisioning, and one that fails *during* a join discards its partial
-/// PGDATA before exiting — so a restart always begins from a clean state.
-fn start_and_wait(cfg: &Config, i: u16) -> Result<()> {
-    let name = cfg.host_name(i);
-    let node = cfg.node_name(i);
-
-    for attempt in 1..=NODE_ATTEMPTS {
-        start_node(cfg, i)?;
-        match wait_for_node(cfg, &name, &node) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < NODE_ATTEMPTS => {
-                term::warn(&format!("{e}"));
-                term::info(&format!(
-                    "retrying {name} (attempt {}/{NODE_ATTEMPTS})",
-                    attempt + 1
-                ));
-            }
-            Err(e) => {
-                println!("{}", term::red(&format!("Last 40 log lines from {name}:")));
-                println!("{}", container::logs_tail(&name, 40));
-                return Err(e);
-            }
-        }
-    }
-    unreachable!("loop returns on the final attempt")
-}
-
-/// Start node `i`, creating its volume first if this is its first run.
-///
-/// An existing container is simply started again; an existing *stopped* one is
-/// not recreated, so a node keeps its identity and data across `down`/`up`.
 /// Everything the entrypoint needs is passed as environment variables — the
 /// image itself holds no per-node configuration.
 fn start_node(cfg: &Config, i: u16) -> Result<()> {
+    let d = deployment(cfg);
+    if !lifecycle::prepare_node(&d, i)? {
+        return Ok(());
+    }
+
     let name = cfg.host_name(i);
     let fqdn = cfg.host_fqdn(i);
     let node = cfg.node_name(i);
-    let vol = cfg.volume_name(i);
-
-    match container::state(&name) {
-        container::State::Running => {
-            term::ok(&format!("{name} already running"));
-            return Ok(());
-        }
-        container::State::Stopped => {
-            term::info(&format!("starting existing container {name}"));
-            if !container::quiet_ok(&["start", &name]) {
-                bail!("could not start {name}");
-            }
-            return Ok(());
-        }
-        container::State::Absent => {}
-    }
-
-    if !container::volume_exists(&vol) {
-        if !container::quiet_ok(&["volume", "create", &vol]) {
-            bail!("could not create volume {vol}");
-        }
-        term::ok(&format!("created volume {vol}"));
-    }
-
     term::info(&format!("running {name} ({node}) at {fqdn}"));
 
     let monitor_flag = if cfg.monitor { "on" } else { "off" };
-    let args: Vec<String> = vec![
-        "run".into(),
-        "--detach".into(),
-        "--name".into(),
-        name.clone(),
-        "--cpus".into(),
-        cfg.cpus.clone(),
-        "--memory".into(),
-        cfg.memory.clone(),
-        "--dns-search".into(),
-        cfg.domain.clone(),
-        "--volume".into(),
-        format!("{vol}:/var/lib/cider-press"),
+    let pgd_args: Vec<String> = vec![
         "--publish".into(),
         format!("127.0.0.1:{}:{PG_CONTAINER_PORT}", cfg.pg_port(i)),
         "--publish".into(),
@@ -325,6 +181,8 @@ fn start_node(cfg: &Config, i: u16) -> Result<()> {
         format!("PGPASSWORD={}", cfg.password),
         cfg.image.clone(),
     ];
+    let mut args = lifecycle::base_run_args(cfg, &d, i);
+    args.extend(pgd_args);
 
     if !container::run_streaming(&args)? {
         bail!("could not run {name}");
@@ -339,32 +197,12 @@ fn start_node(cfg: &Config, i: u16) -> Result<()> {
 /// against a fresh PGD cluster are not safe. Each node must be a confirmed
 /// member before the next one starts.
 ///
-/// Everything before the loop is a precondition check. Getting those wrong
-/// produces failures minutes later inside a container, so they are worth
-/// failing fast on.
+/// The precondition checks are shared (`lifecycle::preflight`); getting any of
+/// them wrong produces failures minutes later inside a container.
 pub fn up(cfg: &Config) -> Result<()> {
-    if !container::installed() {
-        bail!("container is not installed — run: cider doctor");
-    }
-    if !container::system_running() {
-        bail!("container system is not running — run: container system start");
-    }
-    if !container::image_exists(&cfg.image) {
-        bail!("{} is not built — run: cider pgd build", cfg.image);
-    }
-
-    let path = Config::container_config_path();
-    let current = path.as_deref().and_then(bootstrap::configured_domain);
-    if current.as_deref() != Some(cfg.domain.as_str()) {
-        bail!(
-            "container DNS domain is \"{}\", not \"{}\".\n  \
-             PGD nodes address each other as <host>.{}, so this must match.\n  \
-             Run: cider bootstrap",
-            current.unwrap_or_else(|| "unset".into()),
-            cfg.domain,
-            cfg.domain
-        );
-    }
+    let d = deployment(cfg);
+    lifecycle::preflight(&d)?;
+    lifecycle::require_dns_domain(cfg)?;
 
     term::banner();
     term::info(&format!(
@@ -376,7 +214,12 @@ pub fn up(cfg: &Config) -> Result<()> {
     // Node 1 creates the cluster; the rest join it. Serialised on purpose —
     // PGD joins are not safe to run concurrently against a fresh cluster.
     for i in 1..=cfg.nodes {
-        start_and_wait(cfg, i)?;
+        lifecycle::start_and_wait(
+            &d,
+            i,
+            |i| start_node(cfg, i),
+            |i| node_joined(cfg, &cfg.host_name(i), &cfg.node_name(i)),
+        )?;
     }
 
     apply_pool_mode(cfg);
@@ -554,32 +397,10 @@ pub fn status(cfg: &Config) -> Result<()> {
         None => {
             term::warn("could not read cluster state — falling back to container view");
             println!();
-            containers_table(cfg);
+            lifecycle::containers_table(&deployment(cfg));
         }
     }
     Ok(())
-}
-
-/// Raw `container ls` and `volume list`, filtered to this cluster's own
-/// containers and volumes.
-pub fn containers_table(cfg: &Config) {
-    term::info("containers");
-    if let Some(out) = container::capture(&["ls", "--all"]) {
-        for (n, line) in out.lines().enumerate() {
-            if n == 0 || line.starts_with(&cfg.host_prefix) {
-                println!("{line}");
-            }
-        }
-    }
-    println!();
-    term::info("volumes");
-    if let Some(out) = container::capture(&["volume", "list"]) {
-        for (n, line) in out.lines().enumerate() {
-            if n == 0 || line.starts_with(&cfg.volume_prefix) {
-                println!("{line}");
-            }
-        }
-    }
 }
 
 /// Print every way into the cluster from macOS.
@@ -813,150 +634,5 @@ pub fn ui(cfg: &Config, node: Option<&str>) -> Result<()> {
     {
         term::ok("opened in your default browser");
     }
-    Ok(())
-}
-
-// --- lifecycle -------------------------------------------------------------
-
-/// Stop the node containers, leaving them and their data intact.
-pub fn stop(cfg: &Config) -> Result<()> {
-    for i in 1..=cfg.nodes {
-        let name = cfg.host_name(i);
-        if container::state(&name) == container::State::Running {
-            if stop_node(&name) {
-                term::ok(&format!("stopped {name}"));
-            } else {
-                term::warn(&format!("could not stop {name}"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Start previously stopped node containers.
-pub fn start(cfg: &Config) -> Result<()> {
-    for i in 1..=cfg.nodes {
-        let name = cfg.host_name(i);
-        match container::state(&name) {
-            container::State::Stopped => {
-                if container::quiet_ok(&["start", &name]) {
-                    term::ok(&format!("started {name}"));
-                }
-            }
-            container::State::Running => term::ok(&format!("{name} already running")),
-            container::State::Absent => {
-                term::warn(&format!("{name} does not exist — run: cider pgd up"))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Remove the containers but keep the volumes.
-///
-/// `up` afterwards brings back the *same* cluster — same node identities, same
-/// data — because the volumes still hold each node's data directory.
-pub fn down(cfg: &Config) -> Result<()> {
-    term::banner();
-    term::info("removing containers (volumes and image are kept)");
-    for i in 1..=cfg.nodes {
-        let name = cfg.host_name(i);
-        match container::state(&name) {
-            container::State::Absent => println!("  {}", term::dim(&format!("{name} not present"))),
-            _ => {
-                // Clean shutdown first: `up` afterwards brings this same node
-                // back, and a node killed here recovers on the way up.
-                let _ = stop_node(&name);
-                if container::quiet_ok(&["delete", &name]) {
-                    term::ok(&format!("removed {name}"));
-                }
-            }
-        }
-    }
-    println!();
-    println!("Data is still in the volumes. cider pgd up brings the same cluster back.");
-    println!("To discard everything: cider pgd pomace");
-    Ok(())
-}
-
-/// Destroy everything: containers, volumes, image, optionally the host DNS.
-///
-/// Irreversible, so it lists exactly what will go and requires the cluster name
-/// typed back. `remove_dns` additionally undoes `bootstrap`, and asks again
-/// separately — that part touches settings shared with every other container
-/// on the machine.
-pub fn pomace(cfg: &Config, assume_yes: bool, remove_dns: bool) -> Result<()> {
-    term::banner();
-    println!("{}", term::yellow("This permanently destroys:"));
-    for i in 1..=cfg.nodes {
-        println!(
-            "  container {:<10} volume {:<20} {}",
-            cfg.host_name(i),
-            cfg.volume_name(i),
-            term::dim("(all its data)")
-        );
-    }
-    println!("  image     {}", cfg.image);
-    println!();
-    if remove_dns {
-        println!("Then, with your confirmation, the host DNS setup too (--dns).");
-    } else {
-        println!(
-            "Left alone: your container DNS config and the *.{} resolver.",
-            cfg.domain
-        );
-        println!(
-            "  {}",
-            term::dim("Add --dns to remove those as well (full teardown).")
-        );
-    }
-    println!();
-
-    if !assume_yes {
-        let reply = bootstrap::prompt_line(&format!(
-            "Type the cluster name ({}) to confirm: ",
-            cfg.cluster_name
-        ))?;
-        if reply != cfg.cluster_name {
-            println!("Aborted.");
-            return Ok(());
-        }
-    }
-
-    for i in 1..=cfg.nodes {
-        let name = cfg.host_name(i);
-        if container::exists(&name) {
-            // The volume is about to be deleted, so recovery cost is moot, but
-            // a fast shutdown still returns sooner than waiting out the kill
-            // timer.
-            let _ = stop_node(&name);
-            if container::quiet_ok(&["delete", &name]) {
-                term::ok(&format!("removed container {name}"));
-            }
-        }
-    }
-    for i in 1..=cfg.nodes {
-        let vol = cfg.volume_name(i);
-        if container::volume_exists(&vol) {
-            if container::quiet_ok(&["volume", "delete", &vol]) {
-                term::ok(&format!("removed volume {vol}"));
-            } else {
-                term::warn(&format!("could not remove volume {vol}"));
-            }
-        }
-    }
-    if container::image_exists(&cfg.image) {
-        if container::quiet_ok(&["image", "delete", &cfg.image]) {
-            term::ok(&format!("removed image {}", cfg.image));
-        } else {
-            term::warn(&format!("could not remove image {}", cfg.image));
-        }
-    }
-    if remove_dns {
-        bootstrap::remove_dns_setup(cfg, assume_yes)?;
-    }
-
-    println!();
-    println!("{}", term::green("All pressed out."));
     Ok(())
 }

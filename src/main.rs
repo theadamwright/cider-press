@@ -7,7 +7,8 @@
 //! - [`container`] the only module that shells out to `container` or parses its output
 //! - [`doctor`]    preflight checks, in the order they matter
 //! - [`bootstrap`] one-time host setup: the container DNS domain and macOS resolver
-//! - [`cluster`]   build, up, status, teardown — the verbs themselves
+//! - [`lifecycle`] what every product shares: build, start-and-wait, stop, teardown
+//! - [`cluster`]   PGD's half of the verbs: its containers, readiness, endpoints, web UI
 //! - [`state`]     live cluster state, read through the `pgd` CLI's JSON output
 //! - [`monitor`]   PGD Monitor probes (the 6.5 web UI)
 //! - [`term`]      colour, glyphs, banner
@@ -29,6 +30,7 @@ mod cluster;
 mod config;
 mod container;
 mod doctor;
+mod lifecycle;
 mod monitor;
 mod state;
 mod term;
@@ -69,9 +71,10 @@ enum Top {
 
 /// Everything you can do to a cluster.
 ///
-/// Each arm maps to one function in [`cluster`] (or a small helper below for
-/// the ones that just shell into a container), so adding a verb means adding
-/// an arm here and a function there — nothing else.
+/// Each arm maps to one function — in [`lifecycle`] if every product would do
+/// the same thing, in [`cluster`] if it is PGD's own, or a small helper below
+/// for the ones that just shell into a container. Adding a verb means adding an
+/// arm here and a function there — nothing else.
 #[derive(Subcommand)]
 enum Verb {
     /// Build the node image (needs EDB_SUBSCRIPTION_TOKEN)
@@ -177,13 +180,17 @@ fn run() -> Result<()> {
 }
 
 /// Dispatch a cluster verb. One arm per [`Verb`], and nothing else lives here.
+///
+/// Verbs whose behaviour is the same for every product go straight to
+/// [`lifecycle`]; the rest go to PGD's own module.
 fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
+    let d = cluster::deployment(cfg);
     match verb {
         Verb::Build { no_cache } => cluster::build(cfg, no_cache),
         Verb::Up => cluster::up(cfg),
         Verb::Status => cluster::status(cfg),
         Verb::Containers => {
-            cluster::containers_table(cfg);
+            lifecycle::containers_table(&d);
             Ok(())
         }
         Verb::Endpoints => {
@@ -191,10 +198,10 @@ fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
             Ok(())
         }
         Verb::Ui { node } => cluster::ui(cfg, node.as_deref()),
-        Verb::Stop => cluster::stop(cfg),
-        Verb::Start => cluster::start(cfg),
-        Verb::Down => cluster::down(cfg),
-        Verb::Pomace { yes, dns } => cluster::pomace(cfg, yes, dns),
+        Verb::Stop => lifecycle::stop(&d),
+        Verb::Start => lifecycle::start(&d),
+        Verb::Down => lifecycle::down(&d),
+        Verb::Pomace { yes, dns } => lifecycle::pomace(cfg, &d, yes, dns),
         Verb::Pour => pour(cfg),
         Verb::Psql { node, args } => psql(cfg, node.as_deref(), &args),
         Verb::Cli { args } => pgd_cli(cfg, &args),
