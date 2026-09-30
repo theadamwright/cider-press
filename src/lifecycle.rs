@@ -4,7 +4,7 @@
 //! Nothing here knows what runs inside a node. A product describes its nodes
 //! with a [`Deployment`], and supplies the two things that genuinely differ —
 //! how to create a node's container, and how to tell it is ready — as
-//! closures. PGD's are in `cluster.rs`.
+//! closures. PGD's are in `pgd.rs`.
 //!
 //! Everything in this file exists because of a specific failure: the stop
 //! signal, the retry, the stopped-container check, the typed confirmation on

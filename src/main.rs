@@ -8,7 +8,7 @@
 //! - [`doctor`]    preflight checks, in the order they matter
 //! - [`bootstrap`] one-time host setup: the container DNS domain and macOS resolver
 //! - [`lifecycle`] what every product shares: build, start-and-wait, stop, teardown
-//! - [`cluster`]   PGD's half of the verbs: its containers, readiness, endpoints, web UI
+//! - [`pgd`]       PGD's half of the verbs: its containers, readiness, endpoints, web UI
 //! - [`state`]     live cluster state, read through the `pgd` CLI's JSON output
 //! - [`monitor`]   PGD Monitor probes (the 6.5 web UI)
 //! - [`term`]      colour, glyphs, banner
@@ -26,12 +26,12 @@
 //! a second group would reuse it rather than invent its own grammar.
 
 mod bootstrap;
-mod cluster;
 mod config;
 mod container;
 mod doctor;
 mod lifecycle;
 mod monitor;
+mod pgd;
 mod state;
 mod term;
 
@@ -72,7 +72,7 @@ enum Top {
 /// Everything you can do to a cluster.
 ///
 /// Each arm maps to one function — in [`lifecycle`] if every product would do
-/// the same thing, in [`cluster`] if it is PGD's own, or a small helper below
+/// the same thing, in [`pgd`] if it is PGD's own, or a small helper below
 /// for the ones that just shell into a container. Adding a verb means adding an
 /// arm here and a function there — nothing else.
 #[derive(Subcommand)]
@@ -184,20 +184,20 @@ fn run() -> Result<()> {
 /// Verbs whose behaviour is the same for every product go straight to
 /// [`lifecycle`]; the rest go to PGD's own module.
 fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
-    let d = cluster::deployment(cfg);
+    let d = pgd::deployment(cfg);
     match verb {
-        Verb::Build { no_cache } => cluster::build(cfg, no_cache),
-        Verb::Up => cluster::up(cfg),
-        Verb::Status => cluster::status(cfg),
+        Verb::Build { no_cache } => pgd::build(cfg, no_cache),
+        Verb::Up => pgd::up(cfg),
+        Verb::Status => pgd::status(cfg),
         Verb::Containers => {
             lifecycle::containers_table(&d);
             Ok(())
         }
         Verb::Endpoints => {
-            cluster::endpoints(cfg);
+            pgd::endpoints(cfg);
             Ok(())
         }
-        Verb::Ui { node } => cluster::ui(cfg, node.as_deref()),
+        Verb::Ui { node } => pgd::ui(cfg, node.as_deref()),
         Verb::Stop => lifecycle::stop(&d),
         Verb::Start => lifecycle::start(&d),
         Verb::Down => lifecycle::down(&d),
@@ -216,7 +216,7 @@ fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
 /// Assert a *specific* node is running. Used by the commands where the node is
 /// the point — `psql 2`, `shell 3` — never by the ones that just need a way in.
 fn require_running(cfg: &Config, i: u16) -> Result<String> {
-    let d = cluster::deployment(cfg);
+    let d = pgd::deployment(cfg);
     let name = d.host_name(i);
     if container::state(&name) != container::State::Running {
         anyhow::bail!("{name} is not running — run: cider pgd up");
@@ -226,8 +226,8 @@ fn require_running(cfg: &Config, i: u16) -> Result<String> {
 
 /// psql to the write leader, entering through whichever node is up.
 fn pour(cfg: &Config) -> Result<()> {
-    let d = cluster::deployment(cfg);
-    let i = cluster::first_running(cfg)?;
+    let d = pgd::deployment(cfg);
+    let i = pgd::first_running(cfg)?;
     let name = d.host_name(i);
     term::info(&format!(
         "pouring into the write leader via Connection Manager on {}:{CM_RW_CONTAINER_PORT}",
@@ -252,7 +252,7 @@ fn pour(cfg: &Config) -> Result<()> {
 /// Use this when the node is the point — checking replication has arrived on
 /// node 3, say. For ordinary work you want [`pour`], which finds the leader.
 fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
-    let d = cluster::deployment(cfg);
+    let d = pgd::deployment(cfg);
     let i = d.node_index(node);
     let name = require_running(cfg, i)?;
     let mut cmd: Vec<String> = vec![
@@ -286,8 +286,8 @@ fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
 /// own on the command line still wins, instead of colliding with an injected
 /// flag.
 fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
-    let d = cluster::deployment(cfg);
-    let i = cluster::first_running(cfg)?;
+    let d = pgd::deployment(cfg);
+    let i = pgd::first_running(cfg)?;
     let name = d.host_name(i);
     let dsn = format!(
         "host={} port={CM_RW_CONTAINER_PORT} dbname={} user={}",
@@ -307,7 +307,7 @@ fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
 
 /// An interactive bash shell inside a node container.
 fn shell(cfg: &Config, node: Option<&str>) -> Result<()> {
-    let d = cluster::deployment(cfg);
+    let d = pgd::deployment(cfg);
     let i = d.node_index(node);
     let name = require_running(cfg, i)?;
     container::exec_interactive(

@@ -152,9 +152,9 @@ pub fn pool_mode(cfg: &Config, container_name: &str) -> Option<String> {
 /// `None` when no node is running or the CLI returned nothing usable; the
 /// caller falls back to the container view rather than failing.
 pub fn fetch(cfg: &Config) -> Option<Cluster> {
-    let d = crate::cluster::deployment(cfg);
+    let d = crate::pgd::deployment(cfg);
     // Any running node can answer for the whole cluster.
-    let name = d.host_name(crate::cluster::first_running(cfg).ok()?);
+    let name = d.host_name(crate::pgd::first_running(cfg).ok()?);
 
     let nodes_json = pgd_json(cfg, &name, &["nodes", "list"])?;
     let nodes: Vec<Node> = rows(&nodes_json)

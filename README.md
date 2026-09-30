@@ -848,9 +848,11 @@ cider-press/
 │   ├── container.rs      # the only place apple/container output is parsed
 │   ├── doctor.rs         # preflight checks
 │   ├── bootstrap.rs      # container DNS domain, via toml_edit
-│   ├── cluster.rs        # build / up / status / teardown / web UI
+│   ├── lifecycle.rs      # what every product shares: start, wait, stop, teardown
+│   ├── pgd.rs            # PGD's own: containers, readiness, endpoints, web UI
 │   ├── state.rs          # live cluster state via `pgd -o json`
-│   └── monitor.rs        # PGD Monitor probes
+│   ├── monitor.rs        # PGD Monitor probes
+│   └── term.rs           # colour, glyphs, banner
 ├── image/
 │   ├── Dockerfile        # Debian 12 + PGE 18 + PGD 6.5, token as a secret
 │   └── entrypoint.sh     # per-node provisioning, join, monitor enablement
