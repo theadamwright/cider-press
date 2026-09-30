@@ -12,31 +12,29 @@
 # (apple/container#1809). PGD writes --listen-addr into the cluster catalog as
 # the address peers dial, so a name that resolves only sometimes would produce
 # a cluster that half-works after a restart.
+#
+# What is not PGD-specific -- logging, the privilege drop, waiting for our own
+# name, pg_hba, listen_addresses -- is in lib/node-common.sh, shared with every
+# product's image. What is left here is PGD's own.
 
 set -euo pipefail
-
-log()  { printf '%s [cider-press] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-die()  { printf '%s [cider-press] ERROR: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 
 # shellcheck disable=SC1091
 . /etc/cider-press/image.env
 export PATH="/opt/cider-press/bin:${PATH}"
 
+CIDER_GROUP="pgd"
+# The image path; shellcheck is pointed at the source-tree copy instead.
+# shellcheck source-path=SCRIPTDIR source=lib/node-common.sh
+. /usr/local/lib/cider-press/node-common.sh
+
 # ---------------------------------------------------------------------------
 # Stage 1: root-only work, then drop privileges.
 # ---------------------------------------------------------------------------
 if [ "$(id -u)" = "0" ]; then
-    install -d -o "$PG_SUPERUSER" -g "$PG_SUPERUSER" -m 0750 /var/lib/cider-press
-    install -d -o "$PG_SUPERUSER" -g "$PG_SUPERUSER" -m 0700 "$PGDATA"
-    install -d -o "$PG_SUPERUSER" -g "$PG_SUPERUSER" -m 0750 "$(dirname "$CIDER_PRESS_LOG")"
+    prepare_state_dirs
     install -d -o "$PG_SUPERUSER" -g "$PG_SUPERUSER" -m 0750 /etc/edb/pgd-cli
-
-    # A named volume arrives root-owned; without this the first initdb fails.
-    chown -R "$PG_SUPERUSER":"$PG_SUPERUSER" /var/lib/cider-press
-
-    log "dropping to ${PG_SUPERUSER}"
-    exec setpriv --reuid="$PG_SUPERUSER" --regid="$PG_SUPERUSER" --init-groups \
-         --inh-caps=-all -- "$0" "$@"
+    become_superuser "$@"
 fi
 
 # ---------------------------------------------------------------------------
@@ -79,46 +77,10 @@ log "flavor=${PG_FLAVOR} pg=${PG_MAJOR} first=${PGD_IS_FIRST}"
 } > /etc/edb/pgd-cli/pgd-cli-config.yml
 
 # --- Wait until this node can resolve its own name --------------------------
-# postgres refuses to start if a name in listen_addresses does not resolve, and
-# the container runtime registers a container in its DNS asynchronously, so this
-# races container start. Registration is normally sub-second, but it has been
-# observed to take much longer; the timeout is generous because waiting costs
-# nothing when things are fast, and a spurious failure here is expensive.
+# PGD puts the fully-qualified name in listen_addresses via --listen-addr, so
+# postgres will not start until it resolves. See wait_for_self in
+# lib/node-common.sh.
 PGD_SELF_RESOLVE_TIMEOUT="${PGD_SELF_RESOLVE_TIMEOUT:-180}"
-
-wait_for_self() {
-    local deadline=$(( SECONDS + PGD_SELF_RESOLVE_TIMEOUT ))
-    local waited=0
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        if getent hosts "$PGD_HOST_FQDN" >/dev/null 2>&1; then
-            [ "$waited" -gt 5 ] && log "own name took ${waited}s to register"
-            log "resolved own name ${PGD_HOST_FQDN} -> $(getent hosts "$PGD_HOST_FQDN" | awk '{print $1}' | head -1)"
-            return 0
-        fi
-        sleep 1
-        waited=$(( waited + 1 ))
-    done
-
-    # Two very different causes, and pointing at the wrong one wastes real time.
-    # If resolv.conf carries our domain then DNS *is* configured and the
-    # registration simply did not land -- retrying almost always works.
-    local domain="${PGD_HOST_FQDN#*.}"
-    if grep -qE "^[[:space:]]*(search|domain)[[:space:]]+.*(^|[[:space:]])${domain}([[:space:]]|\$)" \
-         /etc/resolv.conf 2>/dev/null; then
-        die "this node did not register in the runtime's DNS within ${PGD_SELF_RESOLVE_TIMEOUT}s.
-
-     The DNS domain IS configured (resolv.conf carries '${domain}'), so this is
-     a transient registration delay rather than a setup problem -- 'cider doctor'
-     will report everything healthy. Simply run 'cider pgd up' again; it restarts
-     this node and normally succeeds immediately."
-    else
-        die "could not resolve own name ${PGD_HOST_FQDN} after ${PGD_SELF_RESOLVE_TIMEOUT}s,
-     and '${domain}' is not in this container's resolv.conf at all.
-
-     The container DNS domain is probably not configured. On the host run:
-       cider doctor"
-    fi
-}
 
 # --- Wait for the seed node to be ready to accept a join --------------------
 wait_for_seed() {
@@ -136,32 +98,13 @@ wait_for_seed() {
     die "seed node not ready after ${PGD_JOIN_TIMEOUT}s: ${PGD_JOIN_DSN}"
 }
 
-wait_for_self
+wait_for_self "$PGD_HOST_FQDN" "$PGD_SELF_RESOLVE_TIMEOUT"
 
 # --- pg_hba -----------------------------------------------------------------
-# Apple `container` gives every node both an IPv4 and an IPv6 address, and its
-# DNS answers <host>.<domain> with the IPv6 one. The pg_hba.conf that
-# `pgd node setup` generates only covers 0.0.0.0/0, so every by-name connection
-# between nodes is rejected with "no pg_hba.conf entry for host ...".
-#
-# This is that generated file plus the two ::/0 lines.
-HBA_FILE="/var/lib/cider-press/pg_hba.cider.conf"
-write_hba() {
-    cat > "$HBA_FILE" <<'EOF'
-local   all             all                                     trust
-host    all             all             127.0.0.1/32            trust
-host    all             all             ::1/128                 trust
-local   replication     all                                     trust
-host    replication     all             127.0.0.1/32            trust
-host    replication     all             ::1/128                 trust
-host    replication     all             0.0.0.0/0               scram-sha-256
-host    replication     all             ::/0                    scram-sha-256
-host    all             all             0.0.0.0/0               scram-sha-256
-host    all             all             ::/0                    scram-sha-256
-EOF
-    chmod 0600 "$HBA_FILE"
-}
-write_hba
+# The file `pgd node setup` would generate, plus the ::/0 lines it lacks; see
+# write_hba in lib/node-common.sh. Handed to `pgd node setup` via --hba-conf.
+HBA_FILE="${CIDER_STATE_DIR}/pg_hba.cider.conf"
+write_hba "$HBA_FILE"
 
 # --- Provision, once ---------------------------------------------------------
 if [ ! -s "${PGDATA}/PG_VERSION" ]; then
@@ -212,34 +155,21 @@ fi
 # so it can be re-exec'd as PID 1.
 pg_ctl -D "$PGDATA" -m fast stop >/dev/null 2>&1 || true
 
-# --- PGD Monitor (the 6.5.0 web UI) ----------------------------------------
+# --- Post-provisioning configuration ----------------------------------------
+# Three settings, each applied once and then found in postgresql.auto.conf on
+# every later start: listen_addresses (see lib/node-common.sh), the PGD
+# Monitor, and pg_stat_statements. They need a running server, so one is
+# started only if something is missing.
+#
 # bdr.monitor_enabled is defined by the bdr extension, so `postgres -C` cannot
 # see it (that path does not load shared_preload_libraries) and reports it as
-# unrecognised. Ask a running server instead, which is also what validates the
-# value before it is written.
-# Postgres resolves the names in listen_addresses once, at startup. Apple
-# container registers a node's A and AAAA records moments apart, so a node that
-# starts early can bind IPv4 only while its peers bind both -- and then Raft
-# consensus connections to it over IPv6 fail and the node shows Unreachable.
-#
-# Listening on every address removes the race. --listen-addr still carries the
-# fully-qualified name, so the address peers dial is unchanged.
-AUTOCONF="${PGDATA}/postgresql.auto.conf"
-
-has_setting() { grep -qE "^[[:space:]]*$1[[:space:]]*=" "$AUTOCONF" 2>/dev/null; }
-
+# unrecognised. Asking a running server is also what validates the value
+# before it is written.
 needs_config() {
-    grep -qE "^[[:space:]]*listen_addresses[[:space:]]*=[[:space:]]*'\*'" "$AUTOCONF" 2>/dev/null || return 0
+    listens_on_all_addresses || return 0
     [ "${PGD_MONITOR_ENABLED:-on}" = "on" ] && ! has_setting 'bdr\.monitor_enabled' && return 0
     [ "${PGD_STAT_STATEMENTS:-on}" = "on" ] && ! has_setting 'shared_preload_libraries' && return 0
     return 1
-}
-
-run_sql() {
-    psql -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -qc "$1" >/dev/null 2>&1
-}
-query_sql() {
-    psql -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAqc "$1" 2>/dev/null
 }
 
 if needs_config; then
@@ -248,10 +178,7 @@ if needs_config; then
     fi
 
     if pg_isready -q -h 127.0.0.1 -p 5432 2>/dev/null; then
-        # A fixed literal, never a value read back and re-assembled.
-        run_sql "ALTER SYSTEM SET listen_addresses = '*'" \
-            && log "listening on all addresses (IPv4 and IPv6)" \
-            || log "could not set listen_addresses"
+        listen_on_all_addresses
 
         if [ "${PGD_MONITOR_ENABLED:-on}" = "on" ] && ! has_setting 'bdr\.monitor_enabled'; then
             if [ "$(query_sql "select 1 from pg_settings where name = 'bdr.monitor_enabled'" | tr -d '[:space:]')" = "1" ]; then

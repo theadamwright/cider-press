@@ -10,11 +10,13 @@ A CLI that stands up a multi-node EDB Postgres Distributed cluster on Apple's
 1. **`src/`** — a Rust CLI that shells out to `container` and to the `pgd` CLI.
    It holds no cluster logic of its own; it orchestrates.
 2. **`image/`** — a Debian image with PGD installed, plus an entrypoint that
-   provisions or joins one node.
+   provisions or joins one node, and `lib/node-common.sh`, the helpers any
+   product's entrypoint shares.
 
 Everything about *how PGD works* lives in `image/entrypoint.sh`. Everything
-about *how the Mac and the runtime work* lives in `src/`. Keeping that line
-clean is what makes each half readable on its own.
+about *how the Mac and the runtime work* lives in `src/`, and, inside a node,
+in `image/lib/node-common.sh`. Keeping that line clean is what makes each part
+readable on its own.
 
 ## Where to start reading
 
@@ -28,7 +30,9 @@ If you're new to this, roughly an hour in this order:
    in comments. `host-1` vs `host-1.cider` vs `node-1` is the distinction that
    trips people up.
 4. **`image/entrypoint.sh`** — what actually happens inside a node: provision or
-   join, then configure. This is where the PGD knowledge lives.
+   join, then configure. This is where the PGD knowledge lives. The runtime
+   workarounds it calls (privilege drop, waiting for its own name, `pg_hba`,
+   `listen_addresses`) are in `image/lib/node-common.sh`.
 5. **`src/pgd.rs`** — PGD's verbs. Start at `up()` and follow it down; the
    shared parts it calls into (start-and-wait, retry, stop) are in
    `src/lifecycle.rs`.
@@ -95,7 +99,7 @@ pair:
 | `pgd.rs`: `node_joined`, `endpoints`, `ui`, pool mode, `pg_stat_statements`, the Connection Manager wait | PGD only. |
 | `state.rs`, `monitor.rs` | PGD only, and should stay that way. |
 | Verbs | Yes: step 3 below, done. `SharedVerb` (containers, stop, start, down, `pomace`, shell, logs) is flattened into each product's own enum. |
-| `image/entrypoint.sh` | About a third: the privilege drop, the self-resolve wait, `pg_hba` and `listen_addresses`. |
+| `image/entrypoint.sh` | Yes: step 4 below, done. The privilege drop, the self-resolve wait, `pg_hba` and `listen_addresses` are in `image/lib/node-common.sh`. |
 
 The alternative, copying the lifecycle into a second module, is the wrong
 trade. The stop signal, the retry and the `pomace` confirmation each exist
@@ -128,9 +132,13 @@ avoid. So the order is refactor first, then add the product:
    `require_running` helpers take a `Deployment`, so a second product calls
    them as they are. `cluster.rs` was renamed `pgd.rs` in its own commit.
 4. **Move the shared entrypoint helpers into one file that both images
-   source**, so a fix to the `pg_hba` or listen logic lands once. The build
-   context is already `image/`, so a second Dockerfile can sit beside the
-   first.
+   source** *(done)*: `image/lib/node-common.sh`, installed at
+   `/usr/local/lib/cider-press/`. It has logging, the privilege drop, the
+   self-resolve wait, `pg_hba` and `listen_addresses`, so a fix to any of them
+   lands once. The `pg_stat_statements` preload stayed in PGD's entrypoint: it
+   is generic Postgres, but it is also the most delicate code in the file, and
+   nothing needed it moved. The build context is already `image/`, so a second
+   Dockerfile can sit beside the first.
 
 After that comes the product itself: its own Dockerfile, entrypoint and module.
 
@@ -254,9 +262,36 @@ It does **not** cover standing up a cluster — that needs Apple silicon,
 macOS 26+, the runtime, and a subscription token. CI green means the logic is
 sound, not that a cluster comes up. Verifying that is a manual `cider pgd up`.
 
-When changing `image/entrypoint.sh`, remember the blast radius is a node that
-will not boot, several minutes into `up`. Prefer changes that verify themselves
-and roll back, as the `pg_stat_statements` step does.
+When changing `image/entrypoint.sh` or `image/lib/`, remember the blast radius
+is a node that will not boot, several minutes into `up`. Prefer changes that
+verify themselves and roll back, as the `pg_stat_statements` step does.
+`shellcheck -x` in CI catches a lot, but not a call to a function that no
+longer exists.
+
+**You can test an entrypoint change without a token, or touching your own
+cluster.** Everything else in the image is unaffected by such a change, so
+layer the new files over the image you already have:
+
+```dockerfile
+FROM cider-press:latest
+COPY entrypoint.sh /usr/local/bin/cider-press-entrypoint
+RUN chmod 0755 /usr/local/bin/cider-press-entrypoint
+COPY lib/node-common.sh /usr/local/lib/cider-press/node-common.sh
+```
+
+Build that from a copy of `image/` as `cider-press:test`, then press a scratch
+cluster from it with every name and port moved aside:
+
+```bash
+CIDER_IMAGE=cider-press:test CIDER_HOST_PREFIX=scratch- \
+CIDER_VOLUME_PREFIX=test- CIDER_CLUSTER_NAME=scratch \
+CIDER_PG_PORT_BASE=15432 CIDER_CM_PORT_BASE=16432 ./cider pgd up
+```
+
+Empty volumes mean this exercises the cold path: seed, joins, configuration.
+Clean up by deleting the `scratch-*` containers, the `test-*` volumes and the
+test image **by name**. Using `pomace` with the same overrides would work, but
+if an override were lost it would destroy your real cluster and image instead.
 
 ## Style
 

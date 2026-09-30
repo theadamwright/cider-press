@@ -119,6 +119,9 @@ RUN set -eu; \
 COPY entrypoint.sh /usr/local/bin/cider-press-entrypoint
 RUN chmod 0755 /usr/local/bin/cider-press-entrypoint
 
+# Helpers every product's entrypoint shares; sourced, so not executable.
+COPY lib/node-common.sh /usr/local/lib/cider-press/node-common.sh
+
 # 5432 postgres · 6432/6433 Connection Manager rw/ro · 6434 CM health API
 # 6437 PGD Monitor web UI, REST API and /metrics (Postgres port + 1005)
 EXPOSE 5432 6432 6433 6434 6437

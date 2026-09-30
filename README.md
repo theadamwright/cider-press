@@ -855,7 +855,9 @@ cider-press/
 │   └── term.rs           # colour, glyphs, banner
 ├── image/
 │   ├── Dockerfile        # Debian 12 + PGE 18 + PGD 6.5, token as a secret
-│   └── entrypoint.sh     # per-node provisioning, join, monitor enablement
+│   ├── entrypoint.sh     # per-node provisioning, join, monitor enablement
+│   └── lib/
+│       └── node-common.sh  # helpers every node image shares: DNS wait, pg_hba, listen
 ├── .env.example
 ├── ARCHITECTURE.md       # notes for working *on* cider
 ├── LICENSE
