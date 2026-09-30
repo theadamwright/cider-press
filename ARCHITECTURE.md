@@ -50,9 +50,11 @@ more sense once you've seen the moving parts.
 | `monitor.rs` | PGD Monitor probes (the web UI added in PGD 6.5). |
 | `term.rs` | Colour, glyphs, banner. |
 
-Adding a verb means: an arm on `Verb` in `main.rs`, and a function in
-`lifecycle.rs` if every product would do the same thing, or in `pgd.rs` if
-it is PGD's own. Nothing else.
+Adding a verb means an arm and a function, nothing else. If every product
+would do it with the *same code*, the arm goes on `SharedVerb` in `main.rs`
+and the function in `lifecycle.rs`. Otherwise it goes on `PgdVerb` and the
+function in `pgd.rs`. `up` and `status` exist for every product but are on
+`PgdVerb`, because each product implements them differently.
 
 ### Why commands are grouped under `pgd`
 
@@ -92,7 +94,7 @@ pair:
 | `pgd.rs`: `build`, `up`, `start_node` | PGD's remaining half: the token secret, the Connection Manager and monitor ports, the `PGD_*` env and the post-join steps. |
 | `pgd.rs`: `node_joined`, `endpoints`, `ui`, pool mode, `pg_stat_statements`, the Connection Manager wait | PGD only. |
 | `state.rs`, `monitor.rs` | PGD only, and should stay that way. |
-| `Verb` | Not quite. `ui`, `pour` and `cli` belong to PGD; the rest are generic. |
+| Verbs | Yes: step 3 below, done. `SharedVerb` (containers, stop, start, down, `pomace`, shell, logs) is flattened into each product's own enum. |
 | `image/entrypoint.sh` | About a third: the privilege drop, the self-resolve wait, `pg_hba` and `listen_addresses`. |
 
 The alternative, copying the lifecycle into a second module, is the wrong
@@ -117,8 +119,14 @@ avoid. So the order is refactor first, then add the product:
    names and addresses containers the same way. A second product adds its own
    struct beside `PgdConfig`. The environment variable names did not change,
    so existing `.env` files still work.
-3. **Split `Verb`** into shared verbs plus per-product ones, using clap's
-   `#[command(flatten)]`, so `cider logical --help` doesn't offer a web UI.
+3. **Split `Verb`** *(done)* into `SharedVerb`, flattened with clap's
+   `#[command(flatten)]` into each product's own enum (`PgdVerb`), so
+   `cider logical --help` won't offer a web UI. A verb is shared only when one
+   function serves every product; `up`, `status`, `endpoints`, `psql` and
+   `build` are declared per product so each can say what it does, and so
+   dispatch never needs an unreachable arm. The `psql`, `shell` and
+   `require_running` helpers take a `Deployment`, so a second product calls
+   them as they are. `cluster.rs` was renamed `pgd.rs` in its own commit.
 4. **Move the shared entrypoint helpers into one file that both images
    source**, so a fix to the `pg_hba` or listen logic lands once. The build
    context is already `image/`, so a second Dockerfile can sit beside the
@@ -234,7 +242,9 @@ look for it by path — ask `container system dns list`.
 ## Testing
 
 `cargo test` covers the pure logic: config parsing, the TOML editor,
-`container` output parsing, `pgd` JSON shapes, table layout. It runs anywhere.
+`container` output parsing, `pgd` JSON shapes, table layout, the naming and
+port schemes, and the command surface (every verb and alias still parses).
+It runs anywhere.
 
 Only `PG_FLAVOR=pge` has ever been built. The `epas` and `pg` branches of the
 Dockerfile are written, and reference packages that exist for Debian 12 arm64,

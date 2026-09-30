@@ -21,9 +21,11 @@
 //!
 //! The `pgd` group is deliberate even though PGD is the only product here. It
 //! keeps host-level setup and cluster-level work visibly separate, and it
-//! leaves room for a second product (EFM was evaluated and is viable) without a
-//! breaking rename later. [`Verb`] is therefore written to be product-agnostic:
-//! a second group would reuse it rather than invent its own grammar.
+//! leaves room for a second product without a breaking rename later.
+//!
+//! Each product's verbs are its own enum ([`PgdVerb`]) with the verbs every
+//! product shares ([`SharedVerb`]) flattened in, so `cider <group> --help`
+//! lists exactly what that product can do and nothing it can't.
 
 mod bootstrap;
 mod config;
@@ -37,7 +39,8 @@ mod term;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use config::{CM_RW_CONTAINER_PORT, Config};
+use config::{CM_RW_CONTAINER_PORT, Config, PG_CONTAINER_PORT};
+use lifecycle::Deployment;
 
 #[derive(Parser)]
 #[command(
@@ -66,39 +69,20 @@ enum Top {
     },
     /// EDB Postgres Distributed — an active-active cluster
     #[command(subcommand)]
-    Pgd(Verb),
+    Pgd(PgdVerb),
 }
 
-/// Everything you can do to a cluster.
+/// Verbs every product has *and implements the same way* — one function in
+/// [`lifecycle`] or a helper below serves them all.
 ///
-/// Each arm maps to one function — in [`lifecycle`] if every product would do
-/// the same thing, in [`pgd`] if it is PGD's own, or a small helper below
-/// for the ones that just shell into a container. Adding a verb means adding an
-/// arm here and a function there — nothing else.
+/// Flattened into each product's own verb enum, so they appear in its `--help`
+/// as if declared there. The test for belonging here is the implementation,
+/// not the name: `up` and `status` exist for every product, but each does them
+/// differently, so each product declares its own.
 #[derive(Subcommand)]
-enum Verb {
-    /// Build the node image (needs EDB_SUBSCRIPTION_TOKEN)
-    Build {
-        /// Rebuild without using cached layers
-        #[arg(long)]
-        no_cache: bool,
-    },
-    /// Create volumes and press the cluster
-    #[command(alias = "press")]
-    Up,
-    /// Live cluster state
-    #[command(alias = "ps")]
-    Status,
+enum SharedVerb {
     /// Containers and volumes belonging to this cluster
     Containers,
-    /// Every host port this cluster publishes
-    Endpoints,
-    /// Open the PGD Monitor web UI
-    #[command(alias = "web", alias = "monitor")]
-    Ui {
-        /// Node, as "2" or "host-2"
-        node: Option<String>,
-    },
     /// Stop the node containers
     Stop,
     /// Restart stopped node containers
@@ -115,21 +99,6 @@ enum Verb {
         #[arg(long)]
         dns: bool,
     },
-    /// psql to the write leader via Connection Manager
-    Pour,
-    /// psql directly to a node (default 1)
-    Psql {
-        /// Node, as "2" or "host-2"
-        node: Option<String>,
-        /// Extra arguments passed to psql
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Run the product's own CLI, e.g. cider pgd cli cluster show
-    Cli {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// bash inside a node container
     #[command(alias = "sh")]
     Shell {
@@ -143,6 +112,53 @@ enum Verb {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+/// Everything you can do to a PGD cluster.
+///
+/// PGD's own verbs, then the shared ones. Each arm maps to one function, in
+/// [`pgd`] or a helper below. Adding a verb means adding an arm here and a
+/// function there — or, if every product would do it the same way, an arm on
+/// [`SharedVerb`] instead.
+#[derive(Subcommand)]
+enum PgdVerb {
+    /// Build the node image (needs EDB_SUBSCRIPTION_TOKEN)
+    Build {
+        /// Rebuild without using cached layers
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// Create volumes and press the cluster
+    #[command(alias = "press")]
+    Up,
+    /// Live cluster state
+    #[command(alias = "ps")]
+    Status,
+    /// Every host port this cluster publishes
+    Endpoints,
+    /// Open the PGD Monitor web UI
+    #[command(alias = "web", alias = "monitor")]
+    Ui {
+        /// Node, as "2" or "host-2"
+        node: Option<String>,
+    },
+    /// psql to the write leader via Connection Manager
+    Pour,
+    /// psql directly to a node (default 1)
+    Psql {
+        /// Node, as "2" or "host-2"
+        node: Option<String>,
+        /// Extra arguments passed to psql
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run the PGD CLI against the write leader, e.g. cider pgd cli cluster show
+    Cli {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(flatten)]
+    Shared(SharedVerb),
 }
 
 fn main() {
@@ -179,34 +195,40 @@ fn run() -> Result<()> {
     }
 }
 
-/// Dispatch a cluster verb. One arm per [`Verb`], and nothing else lives here.
-///
-/// Verbs whose behaviour is the same for every product go straight to
-/// [`lifecycle`]; the rest go to PGD's own module.
-fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
+/// Dispatch a PGD verb. One arm per [`PgdVerb`], and nothing else lives here.
+fn run_pgd(cfg: &Config, verb: PgdVerb) -> Result<()> {
     let d = pgd::deployment(cfg);
     match verb {
-        Verb::Build { no_cache } => pgd::build(cfg, no_cache),
-        Verb::Up => pgd::up(cfg),
-        Verb::Status => pgd::status(cfg),
-        Verb::Containers => {
-            lifecycle::containers_table(&d);
-            Ok(())
-        }
-        Verb::Endpoints => {
+        PgdVerb::Build { no_cache } => pgd::build(cfg, no_cache),
+        PgdVerb::Up => pgd::up(cfg),
+        PgdVerb::Status => pgd::status(cfg),
+        PgdVerb::Endpoints => {
             pgd::endpoints(cfg);
             Ok(())
         }
-        Verb::Ui { node } => pgd::ui(cfg, node.as_deref()),
-        Verb::Stop => lifecycle::stop(&d),
-        Verb::Start => lifecycle::start(&d),
-        Verb::Down => lifecycle::down(&d),
-        Verb::Pomace { yes, dns } => lifecycle::pomace(cfg, &d, yes, dns),
-        Verb::Pour => pour(cfg),
-        Verb::Psql { node, args } => psql(cfg, node.as_deref(), &args),
-        Verb::Cli { args } => pgd_cli(cfg, &args),
-        Verb::Shell { node } => shell(cfg, node.as_deref()),
-        Verb::Logs { node, args } => {
+        PgdVerb::Ui { node } => pgd::ui(cfg, node.as_deref()),
+        PgdVerb::Pour => pour(cfg),
+        PgdVerb::Psql { node, args } => {
+            psql(cfg, &d, &cfg.pgd.user, &cfg.pgd.db, node.as_deref(), &args)
+        }
+        PgdVerb::Cli { args } => pgd_cli(cfg, &args),
+        PgdVerb::Shared(verb) => run_shared(cfg, &d, verb),
+    }
+}
+
+/// Dispatch a shared verb for any product. One arm per [`SharedVerb`].
+fn run_shared(cfg: &Config, d: &Deployment, verb: SharedVerb) -> Result<()> {
+    match verb {
+        SharedVerb::Containers => {
+            lifecycle::containers_table(d);
+            Ok(())
+        }
+        SharedVerb::Stop => lifecycle::stop(d),
+        SharedVerb::Start => lifecycle::start(d),
+        SharedVerb::Down => lifecycle::down(d),
+        SharedVerb::Pomace { yes, dns } => lifecycle::pomace(cfg, d, yes, dns),
+        SharedVerb::Shell { node } => shell(cfg, d, node.as_deref()),
+        SharedVerb::Logs { node, args } => {
             let i = d.node_index(node.as_deref());
             container::logs(&d.host_name(i), &args)
         }
@@ -215,11 +237,10 @@ fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
 
 /// Assert a *specific* node is running. Used by the commands where the node is
 /// the point — `psql 2`, `shell 3` — never by the ones that just need a way in.
-fn require_running(cfg: &Config, i: u16) -> Result<String> {
-    let d = pgd::deployment(cfg);
+fn require_running(d: &Deployment, i: u16) -> Result<String> {
     let name = d.host_name(i);
     if container::state(&name) != container::State::Running {
-        anyhow::bail!("{name} is not running — run: cider pgd up");
+        anyhow::bail!("{name} is not running — run: {}", d.hint("up"));
     }
     Ok(name)
 }
@@ -247,24 +268,35 @@ fn pour(cfg: &Config) -> Result<()> {
     container::exec_interactive(&name, &[("PGPASSWORD", &cfg.password)], &cmd)
 }
 
-/// psql to one specific node, bypassing Connection Manager's routing.
+/// psql to one specific node, straight to its own Postgres.
 ///
 /// Use this when the node is the point — checking replication has arrived on
-/// node 3, say. For ordinary work you want [`pour`], which finds the leader.
-fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
-    let d = pgd::deployment(cfg);
+/// node 3, say. For PGD, ordinary work wants [`pour`] instead, which goes
+/// through Connection Manager to the leader.
+///
+/// Written for any product: every node image runs Postgres on
+/// [`PG_CONTAINER_PORT`] inside its container, and the caller supplies the
+/// product's own user and database.
+fn psql(
+    cfg: &Config,
+    d: &Deployment,
+    user: &str,
+    db: &str,
+    node: Option<&str>,
+    extra: &[String],
+) -> Result<()> {
     let i = d.node_index(node);
-    let name = require_running(cfg, i)?;
+    let name = require_running(d, i)?;
     let mut cmd: Vec<String> = vec![
         "psql".into(),
         "-h".into(),
         "127.0.0.1".into(),
         "-p".into(),
-        "5432".into(),
+        PG_CONTAINER_PORT.to_string(),
         "-U".into(),
-        cfg.pgd.user.clone(),
+        user.into(),
         "-d".into(),
-        cfg.pgd.db.clone(),
+        db.into(),
     ];
     cmd.extend(extra.iter().cloned());
     container::exec_interactive(&name, &[("PGPASSWORD", &cfg.password)], &cmd)
@@ -305,14 +337,95 @@ fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
     )
 }
 
-/// An interactive bash shell inside a node container.
-fn shell(cfg: &Config, node: Option<&str>) -> Result<()> {
-    let d = pgd::deployment(cfg);
+/// An interactive bash shell inside a node container, for any product.
+fn shell(cfg: &Config, d: &Deployment, node: Option<&str>) -> Result<()> {
     let i = d.node_index(node);
-    let name = require_running(cfg, i)?;
+    let name = require_running(d, i)?;
     container::exec_interactive(
         &name,
         &[("PGPASSWORD", &cfg.password)],
         &["bash".to_string()],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Parse a command line the way the binary would, or panic with clap's
+    /// own error so a failure says what was wrong.
+    fn parse(line: &str) -> Top {
+        Cli::try_parse_from(line.split_whitespace())
+            .unwrap_or_else(|e| panic!("`{line}` did not parse: {e}"))
+            .command
+    }
+
+    // clap's own consistency check. Flattening one enum into another is where
+    // a duplicate verb name or a clashing alias would slip in, and clap only
+    // reports those when the command is built — this makes it a test failure
+    // instead of a runtime one.
+    #[test]
+    fn command_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    // Every verb and alias, as people type them. These are in shell history
+    // and in the README, so a refactor that loses one is a breaking change.
+    #[test]
+    fn every_pgd_verb_and_alias_still_parses() {
+        for line in [
+            "cider pgd build --no-cache",
+            "cider pgd up",
+            "cider pgd press",
+            "cider pgd status",
+            "cider pgd ps",
+            "cider pgd endpoints",
+            "cider pgd ui 2",
+            "cider pgd web",
+            "cider pgd monitor",
+            "cider pgd pour",
+            "cider pgd psql host-2 -c select",
+            "cider pgd cli nodes list -o json",
+            "cider pgd containers",
+            "cider pgd stop",
+            "cider pgd start",
+            "cider pgd down",
+            "cider pgd pomace -y --dns",
+            "cider pgd destroy",
+            "cider pgd shell 3",
+            "cider pgd sh",
+            "cider pgd logs 2 --follow",
+        ] {
+            assert!(matches!(parse(line), Top::Pgd(_)), "{line}");
+        }
+    }
+
+    #[test]
+    fn shared_verbs_arrive_through_the_flattened_arm() {
+        assert!(matches!(
+            parse("cider pgd pomace -y"),
+            Top::Pgd(PgdVerb::Shared(SharedVerb::Pomace {
+                yes: true,
+                dns: false
+            }))
+        ));
+        assert!(matches!(
+            parse("cider pgd sh 2"),
+            Top::Pgd(PgdVerb::Shared(SharedVerb::Shell { node: Some(_) }))
+        ));
+    }
+
+    // Arguments after the node belong to psql, including ones that look like
+    // flags of our own.
+    #[test]
+    fn psql_passes_trailing_arguments_through() {
+        match parse("cider pgd psql 2 -tAc select") {
+            Top::Pgd(PgdVerb::Psql { node, args }) => {
+                assert_eq!(node.as_deref(), Some("2"));
+                assert_eq!(args, ["-tAc", "select"]);
+            }
+            _ => panic!("psql did not parse as psql"),
+        }
+    }
 }
