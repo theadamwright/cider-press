@@ -70,6 +70,8 @@ const NODE_STATE_DIR: &str = "/var/lib/cider-press";
 pub struct Deployment<'a> {
     /// The `<group>` in `cider <group> <verb>`, used in every "run: ..." hint.
     pub group: &'static str,
+    /// What the banner says is being pressed: "PGD", "logical replication".
+    pub title: &'static str,
     /// Typed back to confirm `pomace`.
     pub cluster_name: &'a str,
     pub nodes: u16,
@@ -399,23 +401,43 @@ pub fn start_and_wait(
 /// Raw `container ls` and `volume list`, filtered to this deployment's own
 /// containers and volumes.
 pub fn containers_table(d: &Deployment) {
+    let containers: Vec<String> = (1..=d.nodes).map(|i| d.host_name(i)).collect();
+    let volumes: Vec<String> = (1..=d.nodes).map(|i| d.volume_name(i)).collect();
+
     term::info("containers");
     if let Some(out) = container::capture(&["ls", "--all"]) {
-        for (n, line) in out.lines().enumerate() {
-            if n == 0 || line.starts_with(d.host_prefix) {
-                println!("{line}");
-            }
+        for line in own_rows(&out, &containers) {
+            println!("{line}");
         }
     }
     println!();
     term::info("volumes");
     if let Some(out) = container::capture(&["volume", "list"]) {
-        for (n, line) in out.lines().enumerate() {
-            if n == 0 || line.starts_with(d.volume_prefix) {
-                println!("{line}");
-            }
+        for line in own_rows(&out, &volumes) {
+            println!("{line}");
         }
     }
+}
+
+/// The header of a `container` listing plus the rows whose first column is
+/// one of `names`.
+///
+/// Matched exactly rather than by prefix: every product's volumes start
+/// `cider-press-`, so a prefix match would show one product's volumes under
+/// another's name.
+fn own_rows<'a>(listing: &'a str, names: &[String]) -> Vec<&'a str> {
+    listing
+        .lines()
+        .enumerate()
+        .filter(|(n, line)| {
+            *n == 0
+                || line
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|first| names.iter().any(|name| name == first))
+        })
+        .map(|(_, line)| line)
+        .collect()
 }
 
 // --- lifecycle -------------------------------------------------------------
@@ -473,7 +495,7 @@ pub fn start(d: &Deployment) -> Result<()> {
 /// `up` afterwards brings back the *same* cluster — same node identities, same
 /// data — because the volumes still hold each node's data directory.
 pub fn down(d: &Deployment) -> Result<()> {
-    term::banner();
+    term::banner_for(d.title);
     term::info("removing containers (volumes and image are kept)");
     for i in 1..=d.nodes {
         let name = d.host_name(i);
@@ -505,7 +527,7 @@ pub fn down(d: &Deployment) -> Result<()> {
 /// separately — that part touches settings shared with every other container
 /// on the machine, including any other product's nodes.
 pub fn pomace(cfg: &Config, d: &Deployment, assume_yes: bool, remove_dns: bool) -> Result<()> {
-    term::banner();
+    term::banner_for(d.title);
     println!("{}", term::yellow("This permanently destroys:"));
     for i in 1..=d.nodes {
         println!(
@@ -587,6 +609,7 @@ mod tests {
     fn pgd_like() -> Deployment<'static> {
         Deployment {
             group: "pgd",
+            title: "PGD",
             cluster_name: "cider",
             nodes: 3,
             host_prefix: "host-",
@@ -608,6 +631,28 @@ mod tests {
         // Unrecognised input falls back to node 1 rather than failing.
         assert_eq!(d.node_index(Some("0")), 1);
         assert_eq!(d.node_index(Some("dolores-2")), 1);
+    }
+
+    // Both products' volumes start "cider-press-", and one product's
+    // `containers` must not list the other's.
+    #[test]
+    fn container_table_shows_only_this_deployments_rows() {
+        let listing = "NAME                   TYPE   DRIVER\n\
+                       cider-press-host-1     named  local\n\
+                       cider-press-host-10    named  local\n\
+                       cider-press-dolores-1  named  local\n\
+                       cider-press-host-2     named  local\n";
+        let names = vec![
+            "cider-press-host-1".to_string(),
+            "cider-press-host-2".to_string(),
+        ];
+        let rows = own_rows(listing, &names);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].starts_with("NAME"));
+        assert!(
+            rows.iter()
+                .all(|r| !r.contains("dolores") && !r.contains("host-10"))
+        );
     }
 
     #[test]

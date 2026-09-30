@@ -65,10 +65,15 @@ pub const ART: &str = r#"        \ | /
 
 /// The apple-and-glass banner, printed by the commands that take a while.
 pub fn banner() {
+    banner_for("PGD");
+}
+
+/// The banner, naming what is being pressed: "PGD", "logical replication".
+pub fn banner_for(subject: &str) {
     print!("{ART}");
     println!(
         "\n   {}  {}\n",
         bold_amber("cider-press"),
-        dim("PGD, pressed on Apple container")
+        dim(&format!("{subject}, pressed on Apple container"))
     );
 }

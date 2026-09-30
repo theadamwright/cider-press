@@ -4,14 +4,17 @@ Notes for anyone working *on* cider-press. For using it, see [README.md](README.
 
 ## What this is
 
-A CLI that stands up a multi-node EDB Postgres Distributed cluster on Apple's
-`container` runtime. It owns two things and defers everything else:
+A CLI that stands up clusters on Apple's `container` runtime: a multi-node EDB
+Postgres Distributed cluster (`cider pgd`), and a pair of community PostgreSQL
+nodes for logical replication (`cider logical`). It owns two things and defers
+everything else:
 
 1. **`src/`** — a Rust CLI that shells out to `container` and to the `pgd` CLI.
    It holds no cluster logic of its own; it orchestrates.
-2. **`image/`** — a Debian image with PGD installed, plus an entrypoint that
-   provisions or joins one node, and `lib/node-common.sh`, the helpers any
-   product's entrypoint shares.
+2. **`image/`** — two Debian images, each with an entrypoint that provisions one
+   node: PGD's (`Dockerfile`, `entrypoint.sh`) and logical's
+   (`logical.Dockerfile`, `logical-entrypoint.sh`). Both source
+   `lib/node-common.sh`, the helpers any product's entrypoint shares.
 
 Everything about *how PGD works* lives in `image/entrypoint.sh`. Everything
 about *how the Mac and the runtime work* lives in `src/`, and, inside a node,
@@ -37,6 +40,10 @@ If you're new to this, roughly an hour in this order:
    shared parts it calls into (start-and-wait, retry, stop) are in
    `src/lifecycle.rs`.
 
+If PGD is more than you want to take in at once, read `src/logical.rs` and
+`image/logical-entrypoint.sh` first instead. They're the same shape with no
+cluster to join, so the lifecycle is easier to see.
+
 Then come back to *Six things that will bite you* below, which will make a lot
 more sense once you've seen the moving parts.
 
@@ -44,37 +51,34 @@ more sense once you've seen the moving parts.
 
 | Module | Responsibility |
 |---|---|
-| `config.rs` | Every tunable, resolved once from env/`.env`: shared settings on `Config`, PGD's on `cfg.pgd`. Where every name is formed, and PGD's port maths. No I/O beyond reading env. |
+| `config.rs` | Every tunable, resolved once from env/`.env`: shared settings on `Config`, each product's on `cfg.pgd` and `cfg.logical`. Where every name is formed, and the port maths. No I/O beyond reading env. |
 | `container.rs` | **The only** module that runs `container` or parses its output. If the runtime changes its CLI, this is the blast radius. |
 | `doctor.rs` | Preflight checks, ordered so the first failure is the root cause. |
 | `bootstrap.rs` | One-time host setup: the container DNS domain, the macOS resolver. Edits a file the user owns, so it backs up and verifies. |
 | `lifecycle.rs` | What every product shares: build the image, start a node and wait for it (with the retry), stop, start, down, `pomace`. Knows nothing about what runs inside a node; a product describes its nodes with a `Deployment` and passes in how to create one and how to tell it is ready. |
 | `pgd.rs` | PGD's half: its container flags and environment, join readiness, pooling, `pg_stat_statements`, status, endpoints, the web UI. |
+| `logical.rs` | `cider logical`'s half: its containers, readiness (`wal_level = logical` *and* the name in DNS), a status view of publications, subscriptions and apply errors from public catalogs, and the wiring SQL it prints. Creates no replication itself. |
 | `state.rs` | Live cluster state via the `pgd` CLI's JSON output. |
 | `monitor.rs` | PGD Monitor probes (the web UI added in PGD 6.5). |
 | `term.rs` | Colour, glyphs, banner. |
 
 Adding a verb means an arm and a function, nothing else. If every product
 would do it with the *same code*, the arm goes on `SharedVerb` in `main.rs`
-and the function in `lifecycle.rs`. Otherwise it goes on `PgdVerb` and the
-function in `pgd.rs`. `up` and `status` exist for every product but are on
-`PgdVerb`, because each product implements them differently.
+and the function in `lifecycle.rs`. Otherwise it goes on the product's own enum
+(`PgdVerb`, `LogicalVerb`) and the function in its module. `up` and `status`
+exist for every product but are declared per product, because each implements
+them differently.
 
-### Why commands are grouped under `pgd`
+### Why commands are grouped by product
 
-PGD is the only product here, so `cider pgd up` looks redundant next to
-`cider up`. It is kept on purpose, for two reasons: it separates host-level
-setup (`doctor`, `bootstrap`, which touch your Mac's DNS configuration) from
-cluster work, and it leaves room to add a second product without a breaking
-rename of every command.
+`cider pgd up` and `cider logical up`, rather than one `cider up`. The grouping
+predates the second product: it separates host-level setup (`doctor`,
+`bootstrap`, which touch your Mac's DNS configuration) from cluster work, and
+it left room for `cider logical` without renaming a single existing command.
 
-Three candidates have been considered, none built:
+`cider logical` is built. Two more candidates have been considered, neither
+built:
 
-- **Core PostgreSQL logical replication** — two PGDG nodes with
-  `wal_level = logical`, left for the user to wire up with a publication and a
-  subscription in each direction. The simplest of the three, and the only one
-  that needs no subscription token. It is the worked example in the next
-  section.
 - **EFM** is viable. `edb-efm54` is published for Debian 12 arm64, and a Virtual
   IP works on this runtime (`--cap-add NET_ADMIN`; vmnet routes an address it did
   not assign, verified from both the host and a peer container). EFM's
@@ -85,9 +89,10 @@ Three candidates have been considered, none built:
 
 ### Adding a second product
 
-The command grammar is ready for a second product. The code is about half
-ready. Here is what carries over, measured against the logical-replication
-pair:
+This is how `cider logical` was added, kept as the checklist for a third. The
+shared code was refactored out of PGD first, in four steps, and only then was
+the new product written; nothing of PGD's was copied. The table records what
+carried over when this began, measured against the logical-replication pair:
 
 | Piece | Reusable? |
 |---|---|
@@ -140,23 +145,31 @@ avoid. So the order is refactor first, then add the product:
    nothing needed it moved. The build context is already `image/`, so a second
    Dockerfile can sit beside the first.
 
-After that comes the product itself: its own Dockerfile, entrypoint and module.
+After that came the product itself: `image/logical.Dockerfile`,
+`image/logical-entrypoint.sh`, `src/logical.rs`, `LogicalConfig` and
+`LogicalVerb`. Nothing else changed, apart from two things the second product
+exposed. The Debian pin had to become per-product. And `containers_table`
+had to match exact names instead of prefixes, because both products' volumes
+start `cider-press-`.
 
-A second product must not share these with PGD, or the two can't run at the
-same time: the container prefix (`host-`), the volume prefix, the image tag and
-the loopback ports. PGD occupies 5432-5434 and 6432-6457 today. The
-logical-replication pair is decided as `cider logical`, with containers named
-`dolores-1` and `dolores-2`.
+Two products must not share these, or they can't run at the same time: the
+container names, the volume names, the image tag and the loopback ports. PGD
+uses `host-1..3`, image `cider-press:latest`, and ports 5432-5434 and 6432-6457.
+`cider logical` uses `dolores-1..2`, image `cider-press-logical:latest`, and
+ports 5442-5443. Volume names include the container name, so a shared volume
+prefix is fine.
 
-Of the six things below, a logical-replication pair still hits **#1**. A
-subscription's `CONNECTION` string is stored in the catalog and resolved again
-on every reconnect, so it needs the fully-qualified name for the same reason
-PGD's `--listen-addr` does. It also hits **#2**, because a subscription that
-connects over IPv6 needs the `::/0` line. It mostly avoids **#3** and **#5**:
-if `listen_addresses` is `'*'` from the first start, nothing needs to resolve
-the node's own name at boot.
+Of the six things below, the logical pair still hits **#1**. A subscription's
+`CONNECTION` string is stored in the catalog and resolved again on every
+reconnect, so it needs the fully-qualified name for the same reason PGD's
+`--listen-addr` does. It also hits **#2**, because a subscription that connects
+over IPv6 needs the `::/0` line. It avoids **#3** and, at boot, **#5**:
+`listen_addresses` is `'*'` from the very first start, so nothing needs to
+resolve the node's own name before Postgres starts. But a *peer's* subscription
+still can't reach a node until its name is registered, which is why
+`logical.rs` counts a node as ready only once its name resolves.
 
-## Why Debian 12, and why the version is pinned
+## Why Debian, and why the versions are pinned
 
 EDB publishes PGD for both Debian 12 (arm64) and RHEL 9 (aarch64), so the base
 image was a free choice. Measured on this runtime:
@@ -180,6 +193,13 @@ usually has no PGD packages for months after release. Floating to `latest` would
 eventually break a build at `apt-get install` on a day nothing changed. Bump it
 when you decide to, after checking EDB's compatibility matrix — and check arm64
 specifically, which lags x86_64.
+
+**`cider logical`'s image is on Debian 13** (`CIDER_LOGICAL_DEBIAN_VERSION`),
+pinned separately. PGDG published PostgreSQL 16-18 for Debian 13 arm64 within
+weeks of its release, so there was no reason to hold it back. It also makes the
+logical image the early test of `lib/node-common.sh` on Debian 13, so when PGD
+moves, the library will already be proven there. The cost, until PGD moves too,
+is that a change to the library has to be checked on both Debian 12 and 13.
 
 ## Six things that will bite you
 
@@ -273,6 +293,11 @@ It runs anywhere.
 Only `PG_FLAVOR=pge` has ever been built. The `epas` and `pg` branches of the
 Dockerfile are written, and reference packages that exist for Debian 12 arm64,
 but no cluster has been stood up on either. Treat them as plausible, not proven.
+
+`cider logical` on its defaults (PostgreSQL 18, Debian 13) has been built and
+run end to end: the printed wiring SQL pasted as-is, replication in both
+directions, no echo loop, and a forced `insert_exists` conflict showing in
+`status`. Other `CIDER_LOGICAL_PG_MAJOR` values have not been tried.
 
 It does **not** cover standing up a cluster — that needs Apple silicon,
 macOS 26+, the runtime, and a subscription token. CI green means the logic is

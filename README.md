@@ -32,7 +32,9 @@ rebuilt for a runtime with no `compose`.
 [Write leader](#3-connect-to-the-write-leader) ·
 [Read-only](#4-read-only-load-balanced-across-nodes) ·
 [Web UI](#5-connect-to-the-web-ui) · [Tear down](#6-tear-down) ·
-[Pooling](#connection-pooling) · [Commands](#command-reference) ·
+[Pooling](#connection-pooling) ·
+[Logical replication](#cider-logical-core-postgresql-logical-replication) ·
+[Commands](#command-reference) ·
 [Status](#how-cider-pgd-status-reads-the-cluster) · [DNS](#the-dns-part-the-only-genuinely-tricky-bit) ·
 [Configuration](#configuration) · [Token safety](#about-that-subscription-token) ·
 [Troubleshooting](#troubleshooting)
@@ -60,22 +62,19 @@ or [Hybrid Manager](https://www.enterprisedb.com/docs/pgd/latest/deploying/deplo
 
 ## Could this do more than PGD?
 
-Structurally, yes. Commands are grouped as `cider <product> <verb>`, and most
-verbs are product-agnostic — so a second stack would be a new group reusing the
-same grammar (`cider efm up`, `cider patroni status`) rather than a rewrite. The
-lifecycle code underneath (start, wait, retry, stop, tear down) would need to be
-shared first; [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-second-product) has the
-plan.
+It already does one more thing:
+[**`cider logical`**](#cider-logical-core-postgresql-logical-replication), a
+pair of community PostgreSQL nodes for wiring up logical replication by hand.
+It needs no EDB subscription.
 
-Three candidates, none built and none promised:
+Commands are grouped as `cider <product> <verb>`, and the lifecycle underneath
+(start, wait, retry, stop, tear down) is shared, so another stack would be a new
+group reusing both (`cider efm up`, `cider patroni status`) rather than a
+rewrite. [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-second-product) describes
+how `cider logical` was added.
 
-- **Core PostgreSQL logical replication** — two community PostgreSQL nodes from
-  the [PGDG](https://www.postgresql.org/download/linux/debian/) repository with
-  `wal_level = logical`, ready for you to create a publication and a
-  subscription in each direction (`origin = none`, PostgreSQL 16+). A reference
-  point for what's built into core Postgres, with conflicts, DDL and sequences
-  left to you. The likeliest next addition, and the only one that would need no
-  EDB subscription.
+Two more candidates, neither built and neither promised:
+
 - **[EDB Failover Manager](https://www.enterprisedb.com/docs/efm/latest/)** —
   streaming replication with automatic failover, the classic counterpart to
   PGD's active-active. Evaluated as far as feasibility: `edb-efm54` is published
@@ -477,6 +476,119 @@ CIDER_POOL_MODE=transaction ./cider pgd up      # or set it in .env
 
 ---
 
+## `cider logical`: core PostgreSQL logical replication
+
+Two community PostgreSQL 18 nodes, `dolores-1` and `dolores-2`, built from the
+[PGDG](https://www.postgresql.org/download/linux/debian/) repository on Debian 13,
+both with `wal_level = logical`. cider creates the nodes; the replication between
+them is yours to create, which is the point: it's a quick way to see what core
+logical replication does, and what it leaves to you.
+
+It needs no EDB subscription or token, and it runs alongside a PGD cluster, with
+its own containers, volumes, image and ports (5442 and 5443).
+
+```bash
+./cider logical build
+```
+
+```bash
+./cider logical up
+```
+
+The build takes about 20 seconds. `up` ends by printing the SQL that connects the
+pair in both directions (`./cider logical endpoints` prints it again):
+
+```sql
+-- on BOTH nodes
+CREATE TABLE pingpong (id int PRIMARY KEY, msg text);
+CREATE PUBLICATION pp FOR TABLE pingpong;
+
+-- on dolores-1 (./cider logical psql 1)
+CREATE SUBSCRIPTION from_dolores_2
+  CONNECTION 'host=dolores-2.cider dbname=demo'
+  PUBLICATION pp
+  WITH (origin = none, copy_data = false);
+
+-- on dolores-2 (./cider logical psql 2)
+CREATE SUBSCRIPTION from_dolores_1
+  CONNECTION 'host=dolores-1.cider dbname=demo'
+  PUBLICATION pp
+  WITH (origin = none, copy_data = false);
+```
+
+Paste each part into `./cider logical psql 1` and `./cider logical psql 2`. Then
+`./cider logical status` shows both subscriptions running:
+
+```
+  NODE          WAL       PUBLICATIONS    SUBSCRIPTIONS
+  dolores-1     logical   pp              from_dolores_2 streaming
+  dolores-2     logical   pp              from_dolores_1 streaming
+```
+
+A row inserted on either node now appears on the other. It keeps doing so across
+`./cider logical stop` and `start`, but not straight away: after a restart each
+subscription retries every few seconds until it can reach its peer, and that can
+take a minute or two while the runtime registers the nodes' names in DNS (see
+[Troubleshooting](#troubleshooting)).
+
+The apply-error count in `status` is PostgreSQL's own
+(`pg_stat_subscription_stats.apply_error_count`). It counts *every* error the
+apply worker hits, including failing to reach its peer after a restart, so a
+small count after a restart is expected. Check the node's log
+(`./cider logical logs 1`) before assuming a conflict.
+
+Why the SQL looks the way it does:
+
+- **`origin = none`** (PostgreSQL 16+) stops each node sending the other's changes
+  straight back to it.
+- **`copy_data = false`**, because both tables start empty.
+- **The fully-qualified name** in `CONNECTION`. It's stored, and resolved again on
+  every reconnect, so it needs the name that always resolves; see
+  [the DNS part](#the-dns-part-the-only-genuinely-tricky-bit).
+- **No password.** Each node's server inherits the lab password from its
+  environment, and a superuser's subscription can use it. A non-superuser's
+  subscription must put `password=` in the connection string.
+
+### Seeing a conflict
+
+Core logical replication detects and logs conflicts, but doesn't resolve them.
+Two inserts typed quickly usually won't collide: the first replicates before the
+second is typed. To make one happen, pause both subscriptions, insert the same
+key on each node, then resume them.
+
+On `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 DISABLE;
+INSERT INTO pingpong VALUES (4, 'from dolores-1');
+```
+
+On `dolores-2`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_1 DISABLE;
+INSERT INTO pingpong VALUES (4, 'from dolores-2');
+ALTER SUBSCRIPTION from_dolores_1 ENABLE;
+```
+
+Back on `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 ENABLE;
+```
+
+Now each node keeps its own row 4. Each node's log names the problem
+(`conflict detected on relation "public.pingpong": conflict=insert_exists`), and
+`status` shows the apply worker retrying:
+
+```
+  dolores-1     logical   pp              from_dolores_2 stopped, 4 apply errors
+```
+
+Nothing written afterwards reaches the other node until the conflict is resolved
+by hand. To start again from nothing, run
+`./cider logical pomace -y && ./cider logical build && ./cider logical up`.
+
 ## Command reference
 
 Commands are `cider <product> <verb>`, matching the grammar of EDB's own CLIs
@@ -517,6 +629,20 @@ and one runtime.
 | `cider pgd logs [node]` | Container logs |
 
 `[node]` takes either `2` or `host-2`.
+
+**Logical replication** — `cider logical …`
+
+| | |
+|---|---|
+| `cider logical build [--no-cache]` | Build the node image. No token needed |
+| `cider logical up` / `press` | Create both nodes, then print the SQL to wire them up |
+| `cider logical status` / `ps` | Each node's publications, subscriptions and apply errors |
+| `cider logical endpoints` | How to connect, and the wiring SQL again |
+| `cider logical psql [node] [args…]` | psql to a node (default 1) |
+
+`containers`, `stop`, `start`, `down`, `pomace`, `shell` and `logs` work exactly
+as they do for `pgd`. `[node]` takes `2` or `dolores-2`. There's no `pour`, `cli`
+or `ui`: no leader to route to, no product CLI and no web UI.
 
 ---
 
@@ -621,6 +747,16 @@ Three containers on the default network, each with its own named volume:
 All published on `127.0.0.1` only. Node state lives in the volume at
 `/var/lib/cider-press` — `PGDATA` and the server log together.
 
+`cider logical up` creates two more, with nothing in common with those above, so
+both can run at once:
+
+| container | volume | postgres |
+|---|---|---|
+| `dolores-1` | `cider-press-dolores-1` | **5442** |
+| `dolores-2` | `cider-press-dolores-2` | 5443 |
+
+Its image is `cider-press-logical:latest`, and its database is `demo`.
+
 ---
 
 ## Configuration
@@ -665,6 +801,17 @@ volumes will not be compatible:
 ```bash
 ./cider pgd pomace -y && ./cider pgd build && ./cider pgd up
 ```
+
+`cider logical` has its own settings, all prefixed `CIDER_LOGICAL_` so none can
+be confused with PGD's. The shared ones above (`CIDER_DOMAIN`, `CIDER_PASSWORD`,
+`CIDER_CPUS`, `CIDER_MEMORY`, `CIDER_READY_TIMEOUT`) apply to both.
+
+| Variable | Default | |
+|---|---|---|
+| `CIDER_LOGICAL_PG_MAJOR` | `18` | 16 or later, for `origin = none` |
+| `CIDER_LOGICAL_DEBIAN_VERSION` | `13` | Separate from PGD's `DEBIAN_VERSION` (12): PGDG supports new Debian releases months before EDB does |
+| `CIDER_LOGICAL_DB` | `demo` | The database both nodes create |
+| `CIDER_LOGICAL_PG_PORT_BASE` | `5442` | `dolores-1` gets this, `dolores-2` the next |
 
 ---
 
@@ -866,12 +1013,15 @@ cider-press/
 │   ├── bootstrap.rs      # container DNS domain, via toml_edit
 │   ├── lifecycle.rs      # what every product shares: start, wait, stop, teardown
 │   ├── pgd.rs            # PGD's own: containers, readiness, endpoints, web UI
+│   ├── logical.rs        # cider logical: the pair, its status, the wiring SQL
 │   ├── state.rs          # live cluster state via `pgd -o json`
 │   ├── monitor.rs        # PGD Monitor probes
 │   └── term.rs           # colour, glyphs, banner
 ├── image/
 │   ├── Dockerfile        # Debian 12 + PGE 18 + PGD 6.5, token as a secret
 │   ├── entrypoint.sh     # per-node provisioning, join, monitor enablement
+│   ├── logical.Dockerfile      # Debian 13 + PGDG PostgreSQL 18, no token
+│   ├── logical-entrypoint.sh   # initdb, wal_level = logical, the demo database
 │   └── lib/
 │       └── node-common.sh  # helpers every node image shares: DNS wait, pg_hba, listen
 ├── .env.example
@@ -881,12 +1031,14 @@ cider-press/
 ```
 
 Run `cargo test` for the unit tests — they cover the config rewriter, the
-`container` output parsing, and the `pgd` JSON field matching.
+`container` output parsing, the `pgd` JSON field matching, the naming and port
+schemes, every command and alias, and `cider logical`'s status parsing and
+wiring SQL.
 
 ## Notes and limits
 
 - Apple `container` has no restart policy, so nodes don't come back after a
-  reboot. `cider pgd start` brings them back.
+  reboot. `cider pgd start` (or `cider logical start`) brings them back.
 - Each node is a lightweight VM, not a process — three at 2 GB is ~6 GB of RAM.
   In practice they hold less: allocation is lazy, so three 2 GB nodes measured
   about 2.9 GB resident rather than 6.

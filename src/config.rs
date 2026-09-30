@@ -39,8 +39,6 @@ pub struct Config {
     /// The lab password for every database superuser. It is `secret`, it is
     /// in the README, and that is deliberate: see "What this is for".
     pub password: String,
-    /// Debian major for every image. Pinned; see the Dockerfile for why.
-    pub debian_version: String,
 
     /// Resources for each node container.
     pub cpus: String,
@@ -52,10 +50,15 @@ pub struct Config {
     pub ready_timeout: u64,
 
     pub pgd: PgdConfig,
+    pub logical: LogicalConfig,
 }
 
 /// Settings only PGD uses.
 pub struct PgdConfig {
+    /// Debian major for PGD's image. Pinned to what EDB has certified PGD on;
+    /// see image/Dockerfile.
+    pub debian_version: String,
+
     pub nodes: u16,
     /// Container names are `<host_prefix><i>`: "host-1".
     pub host_prefix: String,
@@ -84,6 +87,34 @@ pub struct PgdConfig {
 
     /// Needed by `cider pgd build` only. Never stored anywhere by this tool.
     pub token: Option<String>,
+}
+
+/// Settings only `cider logical` uses: two community PostgreSQL nodes from
+/// the PGDG repository, for wiring up logical replication by hand.
+///
+/// Every name and port here differs from PGD's, so both can run at once.
+pub struct LogicalConfig {
+    /// Always two: a pair is what the printed publication/subscription
+    /// example wires up.
+    pub nodes: u16,
+    /// Container names are `<host_prefix><i>`: "dolores-1".
+    pub host_prefix: String,
+    pub volume_prefix: String,
+    pub image: String,
+    /// Typed back to confirm `cider logical pomace`.
+    pub cluster_name: String,
+
+    pub db: String,
+    pub user: String,
+
+    pub pg_major: String,
+    /// Debian major for this image. Independent of PGD's: PGDG publishes for
+    /// new Debian releases quickly, EDB certifies them slowly.
+    pub debian_version: String,
+
+    /// Host port for node 1's Postgres; node 2 gets the next one. Clear of
+    /// PGD's 5432-5434.
+    pub pg_port_base: u16,
 }
 
 /// An environment variable, or `default` if unset or empty.
@@ -125,7 +156,6 @@ impl Config {
         Config {
             domain: var("CIDER_DOMAIN", "cider"),
             password: var("CIDER_PASSWORD", "secret"),
-            debian_version: var("DEBIAN_VERSION", "12"),
 
             cpus: var("CIDER_CPUS", "2"),
             memory: var("CIDER_MEMORY", "2G"),
@@ -134,6 +164,7 @@ impl Config {
             ready_timeout: var_parse("CIDER_READY_TIMEOUT", 420u64),
 
             pgd: PgdConfig::from_env(),
+            logical: LogicalConfig::from_env(),
             root,
         }
     }
@@ -172,6 +203,8 @@ impl PgdConfig {
         };
 
         PgdConfig {
+            // DEBIAN_VERSION, unprefixed, because it predates a second product.
+            debian_version: var("DEBIAN_VERSION", "12"),
             nodes: var_parse("CIDER_NODES", 3u16).max(1),
             host_prefix: var("CIDER_HOST_PREFIX", "host-"),
             node_prefix: var("CIDER_NODE_PREFIX", "node-"),
@@ -258,6 +291,30 @@ impl PgdConfig {
     }
 }
 
+impl LogicalConfig {
+    /// `cider logical`'s settings, all under `CIDER_LOGICAL_*` so none can be
+    /// confused with PGD's. Only called from [`Config::load`].
+    fn from_env() -> Self {
+        LogicalConfig {
+            nodes: 2,
+            host_prefix: var("CIDER_LOGICAL_HOST_PREFIX", "dolores-"),
+            volume_prefix: var("CIDER_LOGICAL_VOLUME_PREFIX", "cider-press-"),
+            image: var("CIDER_LOGICAL_IMAGE", "cider-press-logical:latest"),
+            cluster_name: "dolores".into(),
+            db: var("CIDER_LOGICAL_DB", "demo"),
+            user: "postgres".into(),
+            pg_major: var("CIDER_LOGICAL_PG_MAJOR", "18"),
+            debian_version: var("CIDER_LOGICAL_DEBIAN_VERSION", "13"),
+            pg_port_base: var_parse("CIDER_LOGICAL_PG_PORT_BASE", 5442u16),
+        }
+    }
+
+    /// Host port forwarding to node `i`'s Postgres: 5442, 5443.
+    pub fn pg_port(&self, i: u16) -> u16 {
+        self.pg_port_base + i - 1
+    }
+}
+
 /// The directory holding the project, so `image/` and `.env` are found whether
 /// the binary is run from `target/release` or via the shim.
 fn exe_root() -> PathBuf {
@@ -335,6 +392,7 @@ mod tests {
     /// the environment so a developer's own `.env` cannot change the result.
     fn pgd_defaults() -> PgdConfig {
         PgdConfig {
+            debian_version: "12".into(),
             nodes: 3,
             host_prefix: "host-".into(),
             node_prefix: "node-".into(),

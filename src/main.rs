@@ -8,6 +8,7 @@
 //! - [`doctor`]    preflight checks, in the order they matter
 //! - [`bootstrap`] one-time host setup: the container DNS domain and macOS resolver
 //! - [`lifecycle`] what every product shares: build, start-and-wait, stop, teardown
+//! - [`logical`]   `cider logical`: a community PostgreSQL pair for logical replication
 //! - [`pgd`]       PGD's half of the verbs: its containers, readiness, endpoints, web UI
 //! - [`state`]     live cluster state, read through the `pgd` CLI's JSON output
 //! - [`monitor`]   PGD Monitor probes (the 6.5 web UI)
@@ -32,6 +33,7 @@ mod config;
 mod container;
 mod doctor;
 mod lifecycle;
+mod logical;
 mod monitor;
 mod pgd;
 mod state;
@@ -70,6 +72,9 @@ enum Top {
     /// EDB Postgres Distributed — an active-active cluster
     #[command(subcommand)]
     Pgd(PgdVerb),
+    /// Two community PostgreSQL nodes, for logical replication you wire up
+    #[command(subcommand)]
+    Logical(LogicalVerb),
 }
 
 /// Verbs every product has *and implements the same way* — one function in
@@ -161,6 +166,39 @@ enum PgdVerb {
     Shared(SharedVerb),
 }
 
+/// Everything you can do to the logical-replication pair.
+///
+/// No `pour`, `cli` or `ui`: there is no leader to route to, no product CLI and
+/// no web UI. The replication itself is yours to create; `endpoints` prints
+/// the SQL.
+#[derive(Subcommand)]
+enum LogicalVerb {
+    /// Build the node image (no token needed)
+    Build {
+        /// Rebuild without using cached layers
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// Create volumes and press the pair
+    #[command(alias = "press")]
+    Up,
+    /// Publications, subscriptions and apply errors on each node
+    #[command(alias = "ps")]
+    Status,
+    /// How to connect, and the SQL to wire up replication
+    Endpoints,
+    /// psql to a node (default 1)
+    Psql {
+        /// Node, as "2" or "dolores-2"
+        node: Option<String>,
+        /// Extra arguments passed to psql
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(flatten)]
+    Shared(SharedVerb),
+}
+
 fn main() {
     restore_default_sigpipe();
     if let Err(e) = run() {
@@ -192,6 +230,30 @@ fn run() -> Result<()> {
         Top::Doctor => doctor::run(&cfg),
         Top::Bootstrap { yes } => bootstrap::run(&cfg, yes),
         Top::Pgd(verb) => run_pgd(&cfg, verb),
+        Top::Logical(verb) => run_logical(&cfg, verb),
+    }
+}
+
+/// Dispatch a logical verb. One arm per [`LogicalVerb`].
+fn run_logical(cfg: &Config, verb: LogicalVerb) -> Result<()> {
+    let d = logical::deployment(cfg);
+    match verb {
+        LogicalVerb::Build { no_cache } => logical::build(cfg, no_cache),
+        LogicalVerb::Up => logical::up(cfg),
+        LogicalVerb::Status => logical::status(cfg),
+        LogicalVerb::Endpoints => {
+            logical::endpoints(cfg);
+            Ok(())
+        }
+        LogicalVerb::Psql { node, args } => psql(
+            cfg,
+            &d,
+            &cfg.logical.user,
+            &cfg.logical.db,
+            node.as_deref(),
+            &args,
+        ),
+        LogicalVerb::Shared(verb) => run_shared(cfg, &d, verb),
     }
 }
 
@@ -426,6 +488,45 @@ mod tests {
                 assert_eq!(args, ["-tAc", "select"]);
             }
             _ => panic!("psql did not parse as psql"),
+        }
+    }
+
+    #[test]
+    fn every_logical_verb_and_alias_parses() {
+        for line in [
+            "cider logical build --no-cache",
+            "cider logical up",
+            "cider logical press",
+            "cider logical status",
+            "cider logical ps",
+            "cider logical endpoints",
+            "cider logical psql 2 -c select",
+            "cider logical containers",
+            "cider logical stop",
+            "cider logical start",
+            "cider logical down",
+            "cider logical pomace -y",
+            "cider logical shell 1",
+            "cider logical logs 2",
+        ] {
+            assert!(matches!(parse(line), Top::Logical(_)), "{line}");
+        }
+    }
+
+    // The point of per-product verb enums: `cider logical --help` offers only
+    // what the pair can do, and PGD's own verbs are rejected, not accepted and
+    // then failing.
+    #[test]
+    fn logical_rejects_pgds_own_verbs() {
+        for line in [
+            "cider logical ui",
+            "cider logical pour",
+            "cider logical cli nodes list",
+        ] {
+            assert!(
+                Cli::try_parse_from(line.split_whitespace()).is_err(),
+                "{line} should not parse"
+            );
         }
     }
 }

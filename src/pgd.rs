@@ -29,6 +29,7 @@ const CM_READY_TIMEOUT_SECS: u64 = 60;
 pub fn deployment(cfg: &Config) -> Deployment<'_> {
     Deployment {
         group: "pgd",
+        title: "PGD",
         cluster_name: &cfg.pgd.cluster_name,
         nodes: cfg.pgd.nodes,
         host_prefix: &cfg.pgd.host_prefix,
@@ -85,7 +86,7 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
         "  flavor   {}  postgres {}",
         cfg.pgd.pg_flavor, cfg.pgd.pg_major
     );
-    println!("  base     debian:{}-slim (arm64)", cfg.debian_version);
+    println!("  base     debian:{}-slim (arm64)", cfg.pgd.debian_version);
     println!("  token    passed as a BuildKit secret, never stored in the image");
     println!();
 
@@ -99,7 +100,7 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
         "--build-arg".into(),
         format!("PG_MAJOR={}", cfg.pgd.pg_major),
         "--build-arg".into(),
-        format!("DEBIAN_VERSION={}", cfg.debian_version),
+        format!("DEBIAN_VERSION={}", cfg.pgd.debian_version),
     ];
     lifecycle::build_image(cfg, &deployment(cfg), &extra, no_cache)
 }

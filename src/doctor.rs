@@ -144,6 +144,16 @@ pub fn run(cfg: &Config) -> Result<()> {
         ));
         warnings += 1;
     }
+    // Optional, so its absence is noted rather than counted as a warning:
+    // most people will only ever use PGD.
+    if container::installed() && container::image_exists(&cfg.logical.image) {
+        term::ok(&format!("{} is built", cfg.logical.image));
+    } else {
+        term::skip(&format!(
+            "{} not built (optional) — cider logical build",
+            cfg.logical.image
+        ));
+    }
 
     println!();
     if blocking > 0 {
