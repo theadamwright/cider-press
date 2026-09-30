@@ -207,8 +207,8 @@ fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
         Verb::Cli { args } => pgd_cli(cfg, &args),
         Verb::Shell { node } => shell(cfg, node.as_deref()),
         Verb::Logs { node, args } => {
-            let i = cfg.node_index(node.as_deref());
-            container::logs(&cfg.host_name(i), &args)
+            let i = d.node_index(node.as_deref());
+            container::logs(&d.host_name(i), &args)
         }
     }
 }
@@ -216,7 +216,8 @@ fn run_pgd(cfg: &Config, verb: Verb) -> Result<()> {
 /// Assert a *specific* node is running. Used by the commands where the node is
 /// the point — `psql 2`, `shell 3` — never by the ones that just need a way in.
 fn require_running(cfg: &Config, i: u16) -> Result<String> {
-    let name = cfg.host_name(i);
+    let d = cluster::deployment(cfg);
+    let name = d.host_name(i);
     if container::state(&name) != container::State::Running {
         anyhow::bail!("{name} is not running — run: cider pgd up");
     }
@@ -225,22 +226,23 @@ fn require_running(cfg: &Config, i: u16) -> Result<String> {
 
 /// psql to the write leader, entering through whichever node is up.
 fn pour(cfg: &Config) -> Result<()> {
+    let d = cluster::deployment(cfg);
     let i = cluster::first_running(cfg)?;
-    let name = cfg.host_name(i);
+    let name = d.host_name(i);
     term::info(&format!(
         "pouring into the write leader via Connection Manager on {}:{CM_RW_CONTAINER_PORT}",
-        cfg.host_fqdn(i)
+        d.host_fqdn(i)
     ));
     let cmd: Vec<String> = vec![
         "psql".into(),
         "-h".into(),
-        cfg.host_fqdn(i),
+        d.host_fqdn(i),
         "-p".into(),
         CM_RW_CONTAINER_PORT.to_string(),
         "-U".into(),
-        cfg.user.clone(),
+        cfg.pgd.user.clone(),
         "-d".into(),
-        cfg.db.clone(),
+        cfg.pgd.db.clone(),
     ];
     container::exec_interactive(&name, &[("PGPASSWORD", &cfg.password)], &cmd)
 }
@@ -250,7 +252,8 @@ fn pour(cfg: &Config) -> Result<()> {
 /// Use this when the node is the point — checking replication has arrived on
 /// node 3, say. For ordinary work you want [`pour`], which finds the leader.
 fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
-    let i = cfg.node_index(node);
+    let d = cluster::deployment(cfg);
+    let i = d.node_index(node);
     let name = require_running(cfg, i)?;
     let mut cmd: Vec<String> = vec![
         "psql".into(),
@@ -259,9 +262,9 @@ fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
         "-p".into(),
         "5432".into(),
         "-U".into(),
-        cfg.user.clone(),
+        cfg.pgd.user.clone(),
         "-d".into(),
-        cfg.db.clone(),
+        cfg.pgd.db.clone(),
     ];
     cmd.extend(extra.iter().cloned());
     container::exec_interactive(&name, &[("PGPASSWORD", &cfg.password)], &cmd)
@@ -283,13 +286,14 @@ fn psql(cfg: &Config, node: Option<&str>, extra: &[String]) -> Result<()> {
 /// own on the command line still wins, instead of colliding with an injected
 /// flag.
 fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
+    let d = cluster::deployment(cfg);
     let i = cluster::first_running(cfg)?;
-    let name = cfg.host_name(i);
+    let name = d.host_name(i);
     let dsn = format!(
         "host={} port={CM_RW_CONTAINER_PORT} dbname={} user={}",
-        cfg.host_fqdn(i),
-        cfg.db,
-        cfg.user
+        d.host_fqdn(i),
+        cfg.pgd.db,
+        cfg.pgd.user
     );
 
     let mut cmd: Vec<String> = vec!["pgd".into()];
@@ -303,7 +307,8 @@ fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
 
 /// An interactive bash shell inside a node container.
 fn shell(cfg: &Config, node: Option<&str>) -> Result<()> {
-    let i = cfg.node_index(node);
+    let d = cluster::deployment(cfg);
+    let i = d.node_index(node);
     let name = require_running(cfg, i)?;
     container::exec_interactive(
         &name,

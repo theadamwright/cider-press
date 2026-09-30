@@ -40,7 +40,7 @@ more sense once you've seen the moving parts.
 
 | Module | Responsibility |
 |---|---|
-| `config.rs` | Every tunable, resolved once from env/`.env`. Naming and port maths. No I/O beyond reading env. |
+| `config.rs` | Every tunable, resolved once from env/`.env`: shared settings on `Config`, PGD's on `cfg.pgd`. Where every name is formed, and PGD's port maths. No I/O beyond reading env. |
 | `container.rs` | **The only** module that runs `container` or parses its output. If the runtime changes its CLI, this is the blast radius. |
 | `doctor.rs` | Preflight checks, ordered so the first failure is the root cause. |
 | `bootstrap.rs` | One-time host setup: the container DNS domain, the macOS resolver. Edits a file the user owns, so it backs up and verifies. |
@@ -87,7 +87,7 @@ pair:
 |---|---|
 | `container.rs`, `bootstrap.rs`, `term.rs` | As-is. PGD appears only in comments, one "Next:" hint and the banner tagline. |
 | `doctor.rs` | Mostly. The token and image checks assume PGD's image. |
-| `config.rs` | Needs splitting. Domain, sizing, credentials and the naming helpers are shared. Group, pool mode, monitor, Connection Manager ports and the token belong to PGD. |
+| `config.rs` | Yes: step 2 below, done. `Config` holds the domain, sizing, password and OS pin; `PgdConfig` (`cfg.pgd`) holds group, pool mode, monitor, Connection Manager ports and the token. |
 | `lifecycle.rs` | Yes: step 1 below, done. Start-and-wait with the retry, stop, start, down, `pomace`, the container table, the build skeleton and the base `container run` flags. |
 | `cluster.rs`: `build`, `up`, `start_node` | PGD's remaining half: the token secret, the Connection Manager and monitor ports, the `PGD_*` env and the post-join steps. |
 | `cluster.rs`: `node_joined`, `endpoints`, `ui`, pool mode, `pg_stat_statements`, the Connection Manager wait | PGD only. |
@@ -110,8 +110,12 @@ avoid. So the order is refactor first, then add the product:
    `Deployment`: only the product publishes them, so the port base stays the
    product's to choose. PGD's behaviour must not change, and CI can't prove
    that, so the refactor ends with a cold `pomace -y && build && up`.
-2. **Split `Config`** into the settings the host shares and the ones each
-   product owns.
+2. **Split `Config`** *(done)*. `Config` keeps what every product shares;
+   PGD's settings are in `cfg.pgd`. Container naming (`host_name`,
+   `host_fqdn`, `node_index`) moved onto `Deployment`, because every product
+   names and addresses containers the same way. A second product adds its own
+   struct beside `PgdConfig`. The environment variable names did not change,
+   so existing `.env` files still work.
 3. **Split `Verb`** into shared verbs plus per-product ones, using clap's
    `#[command(flatten)]`, so `cider logical --help` doesn't offer a web UI.
 4. **Move the shared entrypoint helpers into one file that both images

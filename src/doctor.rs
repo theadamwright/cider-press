@@ -121,7 +121,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
 
     term::info("EDB subscription");
-    match &cfg.token {
+    match &cfg.pgd.token {
         Some(t) => term::ok(&format!(
             "EDB_SUBSCRIPTION_TOKEN is set ({} chars)",
             t.len()
@@ -135,12 +135,12 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
 
     term::info("image");
-    if container::installed() && container::image_exists(&cfg.image) {
-        term::ok(&format!("{} is built", cfg.image));
+    if container::installed() && container::image_exists(&cfg.pgd.image) {
+        term::ok(&format!("{} is built", cfg.pgd.image));
     } else {
         term::warn(&format!(
             "{} not built yet — run: cider pgd build",
-            cfg.image
+            cfg.pgd.image
         ));
         warnings += 1;
     }

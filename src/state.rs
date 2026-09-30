@@ -124,7 +124,7 @@ pub fn pool_mode(cfg: &Config, container_name: &str) -> Option<String> {
     let sql = format!(
         "select server_pool_mode from bdr.node_group_summary \
          where node_group_name = '{}'",
-        cfg.group_name
+        cfg.pgd.group_name
     );
     let out = container::exec_capture(
         container_name,
@@ -136,9 +136,9 @@ pub fn pool_mode(cfg: &Config, container_name: &str) -> Option<String> {
             "-p",
             "5432",
             "-U",
-            &cfg.user,
+            &cfg.pgd.user,
             "-d",
-            &cfg.db,
+            &cfg.pgd.db,
             "-tAqc",
             &sql,
         ],
@@ -152,8 +152,9 @@ pub fn pool_mode(cfg: &Config, container_name: &str) -> Option<String> {
 /// `None` when no node is running or the CLI returned nothing usable; the
 /// caller falls back to the container view rather than failing.
 pub fn fetch(cfg: &Config) -> Option<Cluster> {
+    let d = crate::cluster::deployment(cfg);
     // Any running node can answer for the whole cluster.
-    let name = cfg.host_name(crate::cluster::first_running(cfg).ok()?);
+    let name = d.host_name(crate::cluster::first_running(cfg).ok()?);
 
     let nodes_json = pgd_json(cfg, &name, &["nodes", "list"])?;
     let nodes: Vec<Node> = rows(&nodes_json)
@@ -196,7 +197,7 @@ pub fn fetch(cfg: &Config) -> Option<Cluster> {
 pub fn render(cfg: &Config, c: &Cluster, monitor_health: Option<&str>) {
     println!(
         " {} · PGD 6 · {} node{}",
-        term::bold_amber(&cfg.cluster_name),
+        term::bold_amber(&cfg.pgd.cluster_name),
         c.nodes.len(),
         if c.nodes.len() == 1 { "" } else { "s" }
     );

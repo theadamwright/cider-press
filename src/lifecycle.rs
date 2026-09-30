@@ -55,6 +55,9 @@ pub struct Deployment<'a> {
     pub host_prefix: &'a str,
     pub volume_prefix: &'a str,
     pub image: &'a str,
+    /// The shared container DNS domain, borrowed from `Config`. Here so that
+    /// [`Deployment::host_fqdn`] needs nothing else.
+    pub domain: &'a str,
     /// Relative to the project root. Its directory is the build context.
     pub dockerfile: &'static str,
     /// How long `up` waits for one node to become ready, in seconds.
@@ -67,9 +70,35 @@ impl Deployment<'_> {
         config::container_name(self.host_prefix, i)
     }
 
+    /// Fully-qualified name node `i` is reachable at, e.g. "host-1.cider" —
+    /// what nodes dial each other on, and what macOS can resolve too once
+    /// `cider bootstrap` has run.
+    pub fn host_fqdn(&self, i: u16) -> String {
+        config::host_fqdn(self.host_prefix, i, self.domain)
+    }
+
     /// Named volume holding node `i`'s data directory.
     pub fn volume_name(&self, i: u16) -> String {
         config::volume_name(self.volume_prefix, self.host_prefix, i)
+    }
+
+    /// Resolve a node argument — "2" or "host-2" — to an index. Anything
+    /// missing or unrecognised means node 1, which always exists.
+    pub fn node_index(&self, arg: Option<&str>) -> u16 {
+        match arg {
+            None => 1,
+            Some(s) => {
+                let t = s.trim();
+                if let Ok(n) = t.parse::<u16>()
+                    && n >= 1
+                {
+                    return n;
+                }
+                t.strip_prefix(self.host_prefix)
+                    .and_then(|r| r.parse::<u16>().ok())
+                    .unwrap_or(1)
+            }
+        }
     }
 
     /// A command to suggest to the user, e.g. `hint("up")` is "cider pgd up".
@@ -515,9 +544,27 @@ mod tests {
             host_prefix: "host-",
             volume_prefix: "cider-press-",
             image: "cider-press:latest",
+            domain: "cider",
             dockerfile: "image/Dockerfile",
             ready_timeout: 420,
         }
+    }
+
+    #[test]
+    fn node_arguments_resolve_by_number_or_container_name() {
+        let d = pgd_like();
+        assert_eq!(d.node_index(None), 1);
+        assert_eq!(d.node_index(Some("2")), 2);
+        assert_eq!(d.node_index(Some("host-3")), 3);
+        assert_eq!(d.node_index(Some(" 2 ")), 2);
+        // Unrecognised input falls back to node 1 rather than failing.
+        assert_eq!(d.node_index(Some("0")), 1);
+        assert_eq!(d.node_index(Some("dolores-2")), 1);
+    }
+
+    #[test]
+    fn fqdn_is_container_name_plus_domain() {
+        assert_eq!(pgd_like().host_fqdn(2), "host-2.cider");
     }
 
     // These names are load-bearing: an existing cluster's volumes were created

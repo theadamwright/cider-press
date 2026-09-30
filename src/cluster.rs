@@ -29,14 +29,34 @@ const CM_READY_TIMEOUT_SECS: u64 = 60;
 pub fn deployment(cfg: &Config) -> Deployment<'_> {
     Deployment {
         group: "pgd",
-        cluster_name: &cfg.cluster_name,
-        nodes: cfg.nodes,
-        host_prefix: &cfg.host_prefix,
-        volume_prefix: &cfg.volume_prefix,
-        image: &cfg.image,
+        cluster_name: &cfg.pgd.cluster_name,
+        nodes: cfg.pgd.nodes,
+        host_prefix: &cfg.pgd.host_prefix,
+        volume_prefix: &cfg.pgd.volume_prefix,
+        image: &cfg.pgd.image,
+        domain: &cfg.domain,
         dockerfile: "image/Dockerfile",
         ready_timeout: cfg.ready_timeout,
     }
+}
+
+/// Connection string for the seed node (node 1), which nodes 2..n join to.
+fn join_dsn(cfg: &Config, d: &Deployment) -> String {
+    format!(
+        "host={} port={PG_CONTAINER_PORT} dbname={} user={}",
+        d.host_fqdn(1),
+        cfg.pgd.db,
+        cfg.pgd.user
+    )
+}
+
+/// Every node's FQDN, comma-separated. Handed to the entrypoint so each node
+/// can write a `pgd` CLI config listing the whole cluster.
+fn all_hosts_csv(d: &Deployment) -> String {
+    (1..=d.nodes)
+        .map(|i| d.host_fqdn(i))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // --- build -----------------------------------------------------------------
@@ -51,7 +71,7 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
     if !container::installed() {
         bail!("container is not installed — run: cider doctor");
     }
-    let token = cfg.token.as_deref().context(
+    let token = cfg.pgd.token.as_deref().context(
         "EDB_SUBSCRIPTION_TOKEN is not set.\n\n  \
          export EDB_SUBSCRIPTION_TOKEN=\"your-token\"\n\n  \
          or put it in .env (gitignored). Get a token at\n  \
@@ -60,8 +80,11 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
     let _ = token; // consumed by the build as a secret, read from our environment
 
     term::banner();
-    term::info(&format!("building {}", cfg.image));
-    println!("  flavor   {}  postgres {}", cfg.pg_flavor, cfg.pg_major);
+    term::info(&format!("building {}", cfg.pgd.image));
+    println!(
+        "  flavor   {}  postgres {}",
+        cfg.pgd.pg_flavor, cfg.pgd.pg_major
+    );
     println!("  base     debian:{}-slim (arm64)", cfg.debian_version);
     println!("  token    passed as a BuildKit secret, never stored in the image");
     println!();
@@ -72,9 +95,9 @@ pub fn build(cfg: &Config, no_cache: bool) -> Result<()> {
         "--secret".into(),
         "id=edb_token,env=EDB_SUBSCRIPTION_TOKEN".into(),
         "--build-arg".into(),
-        format!("PG_FLAVOR={}", cfg.pg_flavor),
+        format!("PG_FLAVOR={}", cfg.pgd.pg_flavor),
         "--build-arg".into(),
-        format!("PG_MAJOR={}", cfg.pg_major),
+        format!("PG_MAJOR={}", cfg.pgd.pg_major),
         "--build-arg".into(),
         format!("DEBIAN_VERSION={}", cfg.debian_version),
     ];
@@ -112,9 +135,9 @@ fn node_joined(cfg: &Config, container_name: &str, node_name: &str) -> bool {
             "-p",
             "5432",
             "-U",
-            &cfg.user,
+            &cfg.pgd.user,
             "-d",
-            &cfg.db,
+            &cfg.pgd.db,
             "-tAqc",
             &sql,
         ],
@@ -133,23 +156,23 @@ fn start_node(cfg: &Config, i: u16) -> Result<()> {
         return Ok(());
     }
 
-    let name = cfg.host_name(i);
-    let fqdn = cfg.host_fqdn(i);
-    let node = cfg.node_name(i);
+    let name = d.host_name(i);
+    let fqdn = d.host_fqdn(i);
+    let node = cfg.pgd.node_name(i);
     term::info(&format!("running {name} ({node}) at {fqdn}"));
 
-    let monitor_flag = if cfg.monitor { "on" } else { "off" };
+    let monitor_flag = if cfg.pgd.monitor { "on" } else { "off" };
     let pgd_args: Vec<String> = vec![
         "--publish".into(),
-        format!("127.0.0.1:{}:{PG_CONTAINER_PORT}", cfg.pg_port(i)),
+        format!("127.0.0.1:{}:{PG_CONTAINER_PORT}", cfg.pgd.pg_port(i)),
         "--publish".into(),
-        format!("127.0.0.1:{}:{CM_RW_CONTAINER_PORT}", cfg.cm_rw(i)),
+        format!("127.0.0.1:{}:{CM_RW_CONTAINER_PORT}", cfg.pgd.cm_rw(i)),
         "--publish".into(),
-        format!("127.0.0.1:{}:{CM_RO_CONTAINER_PORT}", cfg.cm_ro(i)),
+        format!("127.0.0.1:{}:{CM_RO_CONTAINER_PORT}", cfg.pgd.cm_ro(i)),
         "--publish".into(),
-        format!("127.0.0.1:{}:{CM_HTTP_CONTAINER_PORT}", cfg.cm_http(i)),
+        format!("127.0.0.1:{}:{CM_HTTP_CONTAINER_PORT}", cfg.pgd.cm_http(i)),
         "--publish".into(),
-        format!("127.0.0.1:{}:{MONITOR_CONTAINER_PORT}", cfg.ui_port(i)),
+        format!("127.0.0.1:{}:{MONITOR_CONTAINER_PORT}", cfg.pgd.ui_port(i)),
         "--env".into(),
         format!("PGD_NODE_NAME={node}"),
         "--env".into(),
@@ -157,29 +180,29 @@ fn start_node(cfg: &Config, i: u16) -> Result<()> {
         "--env".into(),
         format!("PGD_IS_FIRST={}", i == 1),
         "--env".into(),
-        format!("PGD_GROUP_NAME={}", cfg.group_name),
+        format!("PGD_GROUP_NAME={}", cfg.pgd.group_name),
         "--env".into(),
-        format!("PGD_CLUSTER_NAME={}", cfg.cluster_name),
+        format!("PGD_CLUSTER_NAME={}", cfg.pgd.cluster_name),
         "--env".into(),
-        format!("PGD_INITIAL_NODE_COUNT={}", cfg.nodes),
+        format!("PGD_INITIAL_NODE_COUNT={}", cfg.pgd.nodes),
         "--env".into(),
-        format!("PGD_JOIN_DSN={}", cfg.join_dsn()),
+        format!("PGD_JOIN_DSN={}", join_dsn(cfg, &d)),
         "--env".into(),
-        format!("PGD_ALL_HOSTS={}", cfg.all_hosts_csv()),
+        format!("PGD_ALL_HOSTS={}", all_hosts_csv(&d)),
         "--env".into(),
         format!("PGD_MONITOR_ENABLED={monitor_flag}"),
         "--env".into(),
         format!(
             "PGD_STAT_STATEMENTS={}",
-            if cfg.stat_statements { "on" } else { "off" }
+            if cfg.pgd.stat_statements { "on" } else { "off" }
         ),
         "--env".into(),
-        format!("POSTGRES_DB={}", cfg.db),
+        format!("POSTGRES_DB={}", cfg.pgd.db),
         "--env".into(),
-        format!("POSTGRES_USER={}", cfg.user),
+        format!("POSTGRES_USER={}", cfg.pgd.user),
         "--env".into(),
         format!("PGPASSWORD={}", cfg.password),
-        cfg.image.clone(),
+        cfg.pgd.image.clone(),
     ];
     let mut args = lifecycle::base_run_args(cfg, &d, i);
     args.extend(pgd_args);
@@ -207,18 +230,18 @@ pub fn up(cfg: &Config) -> Result<()> {
     term::banner();
     term::info(&format!(
         "pressing a {}-node PGD cluster '{}'",
-        cfg.nodes, cfg.cluster_name
+        cfg.pgd.nodes, cfg.pgd.cluster_name
     ));
     println!();
 
     // Node 1 creates the cluster; the rest join it. Serialised on purpose —
     // PGD joins are not safe to run concurrently against a fresh cluster.
-    for i in 1..=cfg.nodes {
+    for i in 1..=cfg.pgd.nodes {
         lifecycle::start_and_wait(
             &d,
             i,
             |i| start_node(cfg, i),
-            |i| node_joined(cfg, &cfg.host_name(i), &cfg.node_name(i)),
+            |i| node_joined(cfg, &d.host_name(i), &cfg.pgd.node_name(i)),
         )?;
     }
 
@@ -237,10 +260,11 @@ pub fn up(cfg: &Config) -> Result<()> {
 /// actually got the library preloaded — creating it without the library gives
 /// a view that errors on every read, which is worse than not having it.
 fn create_stat_statements(cfg: &Config) {
-    if !cfg.stat_statements {
+    let d = deployment(cfg);
+    if !cfg.pgd.stat_statements {
         return;
     }
-    let host = cfg.host_name(1);
+    let host = d.host_name(1);
     let loaded = container::exec_capture(
         &host,
         &[("PGPASSWORD", cfg.password.as_str())],
@@ -251,9 +275,9 @@ fn create_stat_statements(cfg: &Config) {
             "-p",
             "5432",
             "-U",
-            &cfg.user,
+            &cfg.pgd.user,
             "-d",
-            &cfg.db,
+            &cfg.pgd.db,
             "-tAqc",
             "show shared_preload_libraries",
         ],
@@ -276,9 +300,9 @@ fn create_stat_statements(cfg: &Config) {
             "-p",
             "5432",
             "-U",
-            &cfg.user,
+            &cfg.pgd.user,
             "-d",
-            &cfg.db,
+            &cfg.pgd.db,
             "-qc",
             "CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
         ],
@@ -302,7 +326,7 @@ fn create_stat_statements(cfg: &Config) {
 /// endpoints we print work the instant someone pastes them.
 fn wait_for_connection_manager(cfg: &Config) {
     let Ok(i) = first_running(cfg) else { return };
-    let port = cfg.cm_http(i);
+    let port = cfg.pgd.cm_http(i);
 
     if monitor::cm_ready_rw(port) {
         return;
@@ -331,22 +355,26 @@ fn wait_for_connection_manager(cfg: &Config) {
 /// cluster is formed and inherited by every node. Never fatal: a cluster that
 /// is up but unpooled is still a usable cluster.
 fn apply_pool_mode(cfg: &Config) {
-    if cfg.pool_mode.is_empty() {
+    let d = deployment(cfg);
+    if cfg.pgd.pool_mode.is_empty() {
         return;
     }
-    if !matches!(cfg.pool_mode.as_str(), "none" | "session" | "transaction") {
+    if !matches!(
+        cfg.pgd.pool_mode.as_str(),
+        "none" | "session" | "transaction"
+    ) {
         term::warn(&format!(
             "CIDER_POOL_MODE=\"{}\" is not one of none|session|transaction — leaving pooling alone",
-            cfg.pool_mode
+            cfg.pgd.pool_mode
         ));
         return;
     }
 
-    let host = cfg.host_name(1);
-    if state::pool_mode(cfg, &host).as_deref() == Some(cfg.pool_mode.as_str()) {
+    let host = d.host_name(1);
+    if state::pool_mode(cfg, &host).as_deref() == Some(cfg.pgd.pool_mode.as_str()) {
         term::ok(&format!(
             "connection pooling: {} (already set)",
-            cfg.pool_mode
+            cfg.pgd.pool_mode
         ));
         return;
     }
@@ -357,23 +385,23 @@ fn apply_pool_mode(cfg: &Config) {
         &[
             "pgd",
             "group",
-            &cfg.group_name,
+            &cfg.pgd.group_name,
             "set-option",
             "server_pool_mode",
-            &cfg.pool_mode,
+            &cfg.pgd.pool_mode,
         ],
     );
 
     // Trust the catalog rather than the exit code.
     match state::pool_mode(cfg, &host) {
-        Some(now) if now == cfg.pool_mode => {
+        Some(now) if now == cfg.pgd.pool_mode => {
             term::ok(&format!("connection pooling: {now}"));
         }
         Some(now) => term::warn(&format!(
             "wanted pool mode \"{}\" but the group reports \"{now}\"",
-            cfg.pool_mode
+            cfg.pgd.pool_mode
         )),
-        None if applied => term::ok(&format!("connection pooling: {}", cfg.pool_mode)),
+        None if applied => term::ok(&format!("connection pooling: {}", cfg.pgd.pool_mode)),
         None => term::warn("could not set connection pooling mode"),
     }
 }
@@ -387,8 +415,8 @@ fn apply_pool_mode(cfg: &Config) {
 pub fn status(cfg: &Config) -> Result<()> {
     match state::fetch(cfg) {
         Some(c) => {
-            let health = if cfg.monitor {
-                monitor::health(cfg.ui_port(1))
+            let health = if cfg.pgd.monitor {
+                monitor::health(cfg.pgd.ui_port(1))
             } else {
                 None
             };
@@ -408,6 +436,7 @@ pub fn status(cfg: &Config) -> Result<()> {
 /// Ordered by what you most likely want: the write leader first, then
 /// load-balanced reads, then the web UI, then the raw per-node grid.
 pub fn endpoints(cfg: &Config) {
+    let d = deployment(cfg);
     term::info("connect");
     // Listed first because it is the most robust: psql runs *inside* a node, so
     // it never traverses macOS networking and cannot be intercepted by a VPN or
@@ -425,20 +454,20 @@ pub fn endpoints(cfg: &Config) {
     println!(
         "  PGPASSWORD={} psql -h 127.0.0.1 -p {} -U {} {}",
         cfg.password,
-        cfg.cm_rw(1),
-        cfg.user,
-        cfg.db
+        cfg.pgd.cm_rw(1),
+        cfg.pgd.user,
+        cfg.pgd.db
     );
     // Node 1 is not special: if it is the node that went away, its published
     // port goes with it, and any surviving node's Connection Manager routes to
     // the leader just as well.
-    if cfg.nodes > 1 {
+    if cfg.pgd.nodes > 1 {
         println!(
             "  {}",
             term::dim(&format!(
                 "#   any node routes to the leader — :{} and :{} work too",
-                cfg.cm_rw(2),
-                cfg.cm_rw(cfg.nodes)
+                cfg.pgd.cm_rw(2),
+                cfg.pgd.cm_rw(cfg.pgd.nodes)
             ))
         );
     }
@@ -454,19 +483,19 @@ pub fn endpoints(cfg: &Config) {
     println!(
         "  PGPASSWORD={} psql \"{}\"",
         cfg.password,
-        cfg.read_only_uri()
+        cfg.pgd.read_only_uri()
     );
 
-    if cfg.monitor {
+    if cfg.pgd.monitor {
         println!();
         println!(
             "  {}",
             term::dim(&format!(
                 "# PGD Monitor web UI (login: {} / {})",
-                cfg.user, cfg.password
+                cfg.pgd.user, cfg.password
             ))
         );
-        println!("  {}", cfg.ui_url(1));
+        println!("  {}", cfg.pgd.ui_url(1));
     }
     println!();
     println!("  {}", term::dim("# per-node"));
@@ -474,19 +503,19 @@ pub fn endpoints(cfg: &Config) {
         "  {:<16}{:<10}{:<10}{:<10}{:<11}web-ui",
         "", "postgres", "cm-rw", "cm-ro", "cm-health"
     );
-    for i in 1..=cfg.nodes {
-        let ui = if cfg.monitor {
-            cfg.ui_url(i)
+    for i in 1..=cfg.pgd.nodes {
+        let ui = if cfg.pgd.monitor {
+            cfg.pgd.ui_url(i)
         } else {
             "disabled".to_string()
         };
         println!(
             "  {:<16}:{:<9}:{:<9}:{:<9}:{:<10}{}",
-            cfg.host_name(i),
-            cfg.pg_port(i),
-            cfg.cm_rw(i),
-            cfg.cm_ro(i),
-            cfg.cm_http(i),
+            d.host_name(i),
+            cfg.pgd.pg_port(i),
+            cfg.pgd.cm_rw(i),
+            cfg.pgd.cm_ro(i),
+            cfg.pgd.cm_http(i),
             ui
         );
     }
@@ -496,7 +525,7 @@ pub fn endpoints(cfg: &Config) {
         // route that leaves the host, so a VPN or endpoint-security proxy can
         // block it. Printing a command that fails with "No route to host" sends
         // people hunting for a broken cluster when nothing is wrong.
-        let host = cfg.host_fqdn(1);
+        let host = d.host_fqdn(1);
         if monitor::tcp_reachable(&host, CM_RW_CONTAINER_PORT) {
             println!(
                 "  {}",
@@ -507,9 +536,9 @@ pub fn endpoints(cfg: &Config) {
             );
             println!(
                 "  PGPASSWORD={} psql -h {host} -p {CM_RW_CONTAINER_PORT} -U {} {}",
-                cfg.password, cfg.user, cfg.db
+                cfg.password, cfg.pgd.user, cfg.pgd.db
             );
-            if cfg.monitor {
+            if cfg.pgd.monitor {
                 println!("  http://{host}:{MONITOR_CONTAINER_PORT}/");
             }
             println!(
@@ -545,10 +574,11 @@ pub fn endpoints(cfg: &Config) {
 /// apart: the monitor is switched off, or it is running but the published port
 /// is not reaching it. This probes for both rather than opening a dead tab.
 pub fn ui(cfg: &Config, node: Option<&str>) -> Result<()> {
-    let i = cfg.node_index(node);
-    let name = cfg.host_name(i);
-    let port = cfg.ui_port(i);
-    let url = cfg.ui_url(i);
+    let d = deployment(cfg);
+    let i = d.node_index(node);
+    let name = d.host_name(i);
+    let port = cfg.pgd.ui_port(i);
+    let url = cfg.pgd.ui_url(i);
 
     if container::state(&name) != container::State::Running {
         bail!("{name} is not running — run: cider pgd up");
@@ -605,20 +635,19 @@ pub fn ui(cfg: &Config, node: Option<&str>) -> Result<()> {
     println!("  {}", term::bold(&url));
     // Only offer the by-name URL if it actually works from here; see the same
     // check in `endpoints` for why.
-    if cfg.resolver_installed() && monitor::tcp_reachable(&cfg.host_fqdn(i), MONITOR_CONTAINER_PORT)
-    {
+    if cfg.resolver_installed() && monitor::tcp_reachable(&d.host_fqdn(i), MONITOR_CONTAINER_PORT) {
         println!(
             "  {}",
             term::dim(&format!(
                 "also http://{}:{MONITOR_CONTAINER_PORT}/ (straight to the node, no port forward)",
-                cfg.host_fqdn(i)
+                d.host_fqdn(i)
             ))
         );
     }
     println!();
     println!(
         "  sign in with   user {}   password {}",
-        term::bold(&cfg.user),
+        term::bold(&cfg.pgd.user),
         term::bold(&cfg.password)
     );
     println!(
