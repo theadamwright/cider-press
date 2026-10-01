@@ -335,6 +335,19 @@ came from a failure, and most would apply to running EFM in any container.
   repointed at the new primary. With the default of 0 and no replication slot,
   the new primary had already removed WAL the standby needed, and it retried
   "requested WAL segment has already been removed" for ever.
+- **One synchronous standby, the same line on every node:**
+  `synchronous_standby_names = 'FIRST 1 ("maeve-1", "maeve-2", "maeve-3")'`. The
+  primary's first connected standby in that list is `sync`, and the other is
+  `potential`. A node is never its own standby, so the line is right on every
+  node and after every failover. Promotion is left to EFM's default
+  `use.replay.tiebreaker` (the standby furthest ahead in replay), which picks
+  the synchronous standby or one exactly as current. EFM's priority list isn't
+  tied to it: Postgres and EFM keep separate orderings, and they drift once a
+  failed primary rejoins. The names **must be double-quoted**. They contain a
+  hyphen, and unquoted the value is a syntax error, which makes
+  `postgresql.conf` invalid and the node unbootable (bite #4 again). The
+  entrypoint checks the line with `postgres -C` and removes it if it doesn't
+  parse, so a mistake costs synchronous replication, not the node.
 - **A node being provisioned clones whichever node is primary *now*,** found by
   asking the others' health endpoints. Otherwise rebuilding `maeve-1` after a
   failover would create a second primary beside the promoted one.

@@ -143,6 +143,38 @@ fn in_recovery(cfg: &Config, name: &str) -> Option<bool> {
     })
 }
 
+/// The primary's view of its standbys: `[("maeve-2", "sync"),
+/// ("maeve-3", "potential")]`, by application name, which is each standby's
+/// container name. Empty if the primary is not answering.
+fn sync_states(cfg: &Config, primary: &str) -> Vec<(String, String)> {
+    container::exec_capture(
+        primary,
+        &[("PGPASSWORD", cfg.password.as_str())],
+        &[
+            "psql",
+            "-X",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            &cfg.efm.user,
+            "-d",
+            &cfg.efm.db,
+            "-tAq",
+            "-F",
+            "|",
+            "-c",
+            "select application_name, sync_state from pg_stat_replication",
+        ],
+    )
+    .map(|out| {
+        out.lines()
+            .filter_map(|l| l.split_once('|'))
+            .map(|(app, state)| (app.trim().to_string(), state.trim().to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// The load balancer's backends and their HAProxy state, from its stats page
 /// in CSV: `[("maeve-1", "UP"), ("maeve-2", "DOWN"), ...]`.
 fn lb_backends(cfg: &Config) -> Option<Vec<(String, String)>> {
@@ -374,26 +406,51 @@ pub fn status(cfg: &Config) -> Result<()> {
         d.nodes
     );
     println!();
+    // First pass: each node's role as Postgres sees it, so the primary can be
+    // asked which standby is synchronous.
+    let roles: Vec<(String, Option<Option<bool>>)> = (1..=d.nodes)
+        .map(|i| {
+            let name = d.host_name(i);
+            let role = (container::state(&name) == container::State::Running)
+                .then(|| in_recovery(cfg, &name));
+            (name, role)
+        })
+        .collect();
+    let replication = roles
+        .iter()
+        .find(|(_, role)| *role == Some(Some(false)))
+        .map(|(primary, _)| sync_states(cfg, primary))
+        .unwrap_or_default();
+
     println!(
-        "  {:<12}{:<12}{:<14}HEALTH",
-        "NODE", "POSTGRES", "EFM AGENT"
+        "  {:<12}{:<12}{:<13}{:<14}HEALTH",
+        "NODE", "POSTGRES", "REPLICATION", "EFM AGENT"
     );
-    for i in 1..=d.nodes {
-        let name = d.host_name(i);
-        if container::state(&name) != container::State::Running {
-            let why = match container::state(&name) {
+    for (name, role) in &roles {
+        let Some(in_rec) = role else {
+            let why = match container::state(name) {
                 container::State::Stopped => "stopped",
                 _ => "not created",
             };
             println!("  {name:<12}{}", term::dim(why));
             continue;
-        }
-        let pg = match in_recovery(cfg, &name) {
+        };
+        let pg = match in_rec {
             Some(false) => term::green("primary"),
             Some(true) => "standby".to_string(),
             None => term::yellow("down"),
         };
-        let (agent, code) = match health(&name) {
+        // As the primary reports this standby: sync, potential or async. A
+        // standby the primary does not list is not streaming from it (yet).
+        let repl = match in_rec {
+            Some(false) => "—".to_string(),
+            _ => match replication.iter().find(|(app, _)| app == name) {
+                Some((_, state)) if state == "sync" => term::green("sync"),
+                Some((_, state)) => state.clone(),
+                None => term::yellow("not streaming"),
+            },
+        };
+        let (agent, code) = match health(name) {
             Some(200) => (term::green("primary"), "200".to_string()),
             // 404 means only "not the primary": a standby, or an idle agent
             // whose database has failed. `cli cluster-status` says which.
@@ -402,7 +459,12 @@ pub fn status(cfg: &Config) -> Result<()> {
             None => (term::yellow("not answering"), "—".to_string()),
         };
         // Pad before colouring: escape codes would otherwise count as width.
-        println!("  {name:<12}{}{}{code}", pad(&pg, 12), pad(&agent, 14));
+        println!(
+            "  {name:<12}{}{}{}{code}",
+            pad(&pg, 12),
+            pad(&repl, 13),
+            pad(&agent, 14)
+        );
     }
     println!();
     match container::state(&cfg.efm.lb_name()) {

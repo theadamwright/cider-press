@@ -271,6 +271,47 @@ chown efm:postgres "$EFM_PROPS" "$EFM_NODES_FILE"
 chmod 0640 "$EFM_PROPS" "$EFM_NODES_FILE"
 log "EFM bind.address $(efm_addr "$NODE_FQDN"); nodes: ${nodes}"
 
+# --- One synchronous standby, every start --------------------------------------
+# Every node lists every node, in order, as candidates for synchronous standby:
+#   synchronous_standby_names = 'FIRST 1 (maeve-1, maeve-2, maeve-3)'
+# Whichever node is primary then has exactly one synchronous standby -- the
+# first connected one in that list -- and the other is "potential": not waited
+# for, but synchronous at once if the first goes away. A node is never its own
+# standby, so the same line is right on every node and after every failover,
+# with nothing to rewrite. The names are each standby's application_name, which
+# is its container name (application.name above, and in primary_conninfo).
+#
+# Which standby Failover Manager promotes is left to its default
+# use.replay.tiebreaker: the one furthest ahead in replay. A synchronous
+# standby is never behind on committed data, so a failover promotes it, or one
+# exactly as current -- nothing committed is lost either way.
+#
+# Each name is double-quoted: they contain a hyphen, and unquoted the whole
+# setting is a syntax error -- which makes postgresql.conf invalid and the node
+# unbootable. So the line is also checked with `postgres -C`, which parses the
+# configuration without starting a server, and removed again if it does not
+# parse. A mistake here costs synchronous replication, not the node.
+#
+# Ensured on every start, not just at provisioning, so a data directory made
+# before this setting existed gets it too. Written as postgres, so the file
+# keeps its owner.
+sync_names=""
+for fqdn in ${EFM_NODES//,/ }; do
+    sync_names="${sync_names:+${sync_names}, }\"${fqdn%%.*}\""
+done
+sync_line="synchronous_standby_names = 'FIRST 1 (${sync_names})'  # cider-press"
+pg_conf="${PGDATA}/postgresql.conf"
+if [ -f "$pg_conf" ] && ! grep -qxF "$sync_line" "$pg_conf"; then
+    as_postgres sed -i '/^synchronous_standby_names = .*# cider-press$/d' "$pg_conf"
+    printf '%s\n' "$sync_line" | as_postgres tee -a "$pg_conf" >/dev/null
+    if as_postgres postgres -D "$PGDATA" -C synchronous_standby_names >/dev/null 2>&1; then
+        log "one synchronous standby: FIRST 1 (${sync_names})"
+    else
+        as_postgres sed -i '/^synchronous_standby_names = .*# cider-press$/d' "$pg_conf"
+        log "synchronous_standby_names did not parse; removed it, so replication stays asynchronous"
+    fi
+fi
+
 # --- Supervise ----------------------------------------------------------------
 
 shutdown() {

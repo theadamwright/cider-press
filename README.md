@@ -611,13 +611,39 @@ it needs your EDB subscription token to build.
 then `maeve-2` and `maeve-3` cloned from it.
 
 ```
-  NODE        POSTGRES    EFM AGENT     HEALTH
-  maeve-1     primary     primary       200
-  maeve-2     standby     not primary   404
-  maeve-3     standby     not primary   404
+  NODE        POSTGRES    REPLICATION  EFM AGENT     HEALTH
+  maeve-1     primary     —            primary       200
+  maeve-2     standby     sync         not primary   404
+  maeve-3     standby     potential    not primary   404
 
   load balancer → maeve-1   (127.0.0.1:5450)
 ```
+
+### One synchronous standby
+
+The primary always has one synchronous standby, and the other is `potential`.
+A commit waits until the synchronous standby has it, and the potential one takes
+over as synchronous straight away if the first goes. Every node carries the same
+setting:
+
+```
+synchronous_standby_names = 'FIRST 1 ("maeve-1", "maeve-2", "maeve-3")'
+```
+
+Whichever node is primary, the first *connected* standby in that list is the
+synchronous one. A node is never its own standby, so the same line is right on
+every node and after every failover, with nothing to rewrite. (The names are
+quoted because they contain a hyphen; unquoted, the setting doesn't parse and
+Postgres won't start. The entrypoint checks the setting parses before relying on
+it.)
+
+Which standby gets promoted is left to Failover Manager's default,
+`use.replay.tiebreaker`: the one furthest ahead in replay. A synchronous standby
+is never behind on committed data, so a failover promotes it, or one exactly as
+current, and nothing committed is lost. EFM also has a standby priority list
+(`efm set-priority`, `priority.standbys`). It isn't wired to the synchronous
+standby here, because Postgres and EFM keep separate orderings, and those drift
+apart once a failed primary rejoins.
 
 ### How clients find the primary
 
