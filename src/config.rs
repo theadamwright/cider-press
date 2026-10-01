@@ -51,6 +51,7 @@ pub struct Config {
 
     pub pgd: PgdConfig,
     pub logical: LogicalConfig,
+    pub efm: EfmConfig,
 }
 
 /// Settings only PGD uses.
@@ -165,6 +166,7 @@ impl Config {
 
             pgd: PgdConfig::from_env(),
             logical: LogicalConfig::from_env(),
+            efm: EfmConfig::from_env(),
             root,
         }
     }
@@ -315,6 +317,89 @@ impl LogicalConfig {
     }
 }
 
+/// Settings only `cider efm` uses: a primary and two standbys of EDB Postgres
+/// Extended under EDB Failover Manager, behind an HAProxy load balancer that
+/// follows the primary.
+///
+/// Every name and port here differs from PGD's and logical's, so all three can
+/// run at once.
+pub struct EfmConfig {
+    /// Always three: a primary and two standbys, so a failover has a choice to
+    /// make and leaves a primary and a standby behind it.
+    pub nodes: u16,
+    /// Container names are `<host_prefix><i>`: "maeve-1". The load balancer
+    /// is `<host_prefix>lb`.
+    pub host_prefix: String,
+    pub volume_prefix: String,
+    pub image: String,
+    /// Both the name typed back to confirm `pomace` and Failover Manager's own
+    /// cluster name, which names its files: maeve.properties, maeve.nodes.
+    pub cluster_name: String,
+
+    pub db: String,
+    pub user: String,
+
+    pub pg_major: String,
+    pub efm_version: String,
+    /// Pinned for the same reason as PGD's: EDB certifies OS majors slowly.
+    pub debian_version: String,
+
+    /// The load balancer's Postgres port, which always reaches the primary.
+    /// Node `i` is on the port after it: 5450 is the primary, 5451-5453 the
+    /// nodes themselves.
+    pub port_base: u16,
+    /// The same scheme for the web: the HAProxy stats page on 7880, and each
+    /// node's Failover Manager health endpoint on 7881-7883.
+    pub web_port_base: u16,
+    /// Whether a failed primary rebuilds itself as a standby and rejoins
+    /// (Failover Manager's auto.rewind and auto.basebackup). On by default:
+    /// in a lab, watching it come back is the point. Off, it stays fenced.
+    pub auto_rejoin: bool,
+}
+
+impl EfmConfig {
+    /// `cider efm`'s settings, all under `CIDER_EFM_*`. Only called from
+    /// [`Config::load`].
+    fn from_env() -> Self {
+        EfmConfig {
+            nodes: 3,
+            host_prefix: var("CIDER_EFM_HOST_PREFIX", "maeve-"),
+            volume_prefix: var("CIDER_EFM_VOLUME_PREFIX", "cider-press-"),
+            image: var("CIDER_EFM_IMAGE", "cider-press-efm:latest"),
+            cluster_name: "maeve".into(),
+            db: var("CIDER_EFM_DB", "efmdb"),
+            user: "postgres".into(),
+            pg_major: var("CIDER_EFM_PG_MAJOR", "18"),
+            efm_version: var("CIDER_EFM_VERSION", "5.4"),
+            debian_version: var("CIDER_EFM_DEBIAN_VERSION", "12"),
+            port_base: var_parse("CIDER_EFM_PORT_BASE", 5450u16),
+            web_port_base: var_parse("CIDER_EFM_WEB_PORT_BASE", 7880u16),
+            auto_rejoin: var_on("CIDER_EFM_AUTO_REJOIN"),
+        }
+    }
+
+    /// The load balancer's container name: "maeve-lb".
+    pub fn lb_name(&self) -> String {
+        format!("{}lb", self.host_prefix)
+    }
+    /// Host port for the load balancer, which always reaches the primary.
+    pub fn lb_port(&self) -> u16 {
+        self.port_base
+    }
+    /// Host port for node `i`'s own Postgres.
+    pub fn pg_port(&self, i: u16) -> u16 {
+        self.port_base + i
+    }
+    /// Host port for the HAProxy stats page.
+    pub fn ui_port(&self) -> u16 {
+        self.web_port_base
+    }
+    /// Host port for node `i`'s Failover Manager health endpoint.
+    pub fn health_port(&self, i: u16) -> u16 {
+        self.web_port_base + i
+    }
+}
+
 /// The directory holding the project, so `image/` and `.env` are found whether
 /// the binary is run from `target/release` or via the shim.
 fn exe_root() -> PathBuf {
@@ -430,6 +515,38 @@ mod tests {
         assert_eq!(row(1), (5432, 6432, 6433, 6434, 6437));
         assert_eq!(row(2), (5433, 6442, 6443, 6444, 6447));
         assert_eq!(row(3), (5434, 6452, 6453, 6454, 6457));
+    }
+
+    // Each product's ports, side by side, so a clash between them is caught
+    // here rather than as a `container run` failure.
+    #[test]
+    fn efm_ports_clear_pgds_and_logicals() {
+        let e = EfmConfig::from_env();
+        let efm: Vec<u16> = [e.lb_port(), e.ui_port()]
+            .into_iter()
+            .chain((1..=3).flat_map(|i| [e.pg_port(i), e.health_port(i)]))
+            .collect();
+        assert_eq!(efm, [5450, 7880, 5451, 7881, 5452, 7882, 5453, 7883]);
+        let p = pgd_defaults();
+        let pgd: Vec<u16> = (1..=3)
+            .flat_map(|i| {
+                [
+                    p.pg_port(i),
+                    p.cm_rw(i),
+                    p.cm_ro(i),
+                    p.cm_http(i),
+                    p.ui_port(i),
+                ]
+            })
+            .collect();
+        let logical = [5442, 5443];
+        for port in efm {
+            assert!(
+                !pgd.contains(&port) && !logical.contains(&port),
+                "{port} clashes"
+            );
+        }
+        assert_eq!(e.lb_name(), "maeve-lb");
     }
 
     #[test]

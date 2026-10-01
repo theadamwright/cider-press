@@ -5,16 +5,18 @@ Notes for anyone working *on* cider-press. For using it, see [README.md](README.
 ## What this is
 
 A CLI that stands up clusters on Apple's `container` runtime: a multi-node EDB
-Postgres Distributed cluster (`cider pgd`), and a pair of community PostgreSQL
-nodes for logical replication (`cider logical`). It owns two things and defers
-everything else:
+Postgres Distributed cluster (`cider pgd`), a pair of community PostgreSQL nodes
+for logical replication (`cider logical`), and a primary and two standbys under
+EDB Failover Manager behind a load balancer (`cider efm`). It owns two things
+and defers everything else:
 
 1. **`src/`** — a Rust CLI that shells out to `container` and to the `pgd` CLI.
    It holds no cluster logic of its own; it orchestrates.
-2. **`image/`** — two Debian images, each with an entrypoint that provisions one
-   node: PGD's (`Dockerfile`, `entrypoint.sh`) and logical's
-   (`logical.Dockerfile`, `logical-entrypoint.sh`). Both source
-   `lib/node-common.sh`, the helpers any product's entrypoint shares.
+2. **`image/`** — three Debian images, each with an entrypoint that provisions
+   one node: PGD's (`Dockerfile`, `entrypoint.sh`), logical's
+   (`logical.Dockerfile`, `logical-entrypoint.sh`) and EFM's (`efm.Dockerfile`,
+   `efm-entrypoint.sh`, plus `efm-lb-entrypoint.sh` for its load balancer). All
+   source `lib/node-common.sh`, the helpers any product's entrypoint shares.
 
 Everything about *how PGD works* lives in `image/entrypoint.sh`. Everything
 about *how the Mac and the runtime work* lives in `src/`, and, inside a node,
@@ -44,20 +46,21 @@ If PGD is more than you want to take in at once, read `src/logical.rs` and
 `image/logical-entrypoint.sh` first instead. They're the same shape with no
 cluster to join, so the lifecycle is easier to see.
 
-Then come back to *Seven things that will bite you* below, which will make a lot
+Then come back to *Eight things that will bite you* below, which will make a lot
 more sense once you've seen the moving parts.
 
 ## Module map
 
 | Module | Responsibility |
 |---|---|
-| `config.rs` | Every tunable, resolved once from env/`.env`: shared settings on `Config`, each product's on `cfg.pgd` and `cfg.logical`. Where every name is formed, and the port maths. No I/O beyond reading env. |
+| `config.rs` | Every tunable, resolved once from env/`.env`: shared settings on `Config`, each product's on `cfg.pgd`, `cfg.logical` and `cfg.efm`. Where every name is formed, and the port maths. No I/O beyond reading env. |
 | `container.rs` | **The only** module that runs `container` or parses its output. If the runtime changes its CLI, this is the blast radius. |
 | `doctor.rs` | Preflight checks, ordered so the first failure is the root cause. |
 | `bootstrap.rs` | One-time host setup: the container DNS domain, the macOS resolver. Edits a file the user owns, so it backs up and verifies. |
-| `lifecycle.rs` | What every product shares: build the image, start a node and wait for it (with the retry), stop, start, down, `pomace`. Knows nothing about what runs inside a node; a product describes its nodes with a `Deployment` and passes in how to create one and how to tell it is ready. |
+| `lifecycle.rs` | What every product shares: build the image, start a node and wait for it (with the retry), stop, start, down, `pomace`, and stable addresses (fixed MACs, `CIDER_PEERS`). Knows nothing about what runs inside a node; a product describes its nodes with a `Deployment` and passes in how to create one and how to tell it is ready. A `Deployment` can also have *extras*: containers that aren't numbered nodes, have no volume, start before the nodes and stop after them, like EFM's load balancer. |
 | `pgd.rs` | PGD's half: its container flags and environment, join readiness, pooling, `pg_stat_statements`, status, endpoints, the web UI. |
 | `logical.rs` | `cider logical`'s half: its containers, readiness (`wal_level = logical` *and* the name in DNS), a status view of publications, subscriptions and apply errors from public catalogs, and the wiring SQL it prints. Creates no replication itself. |
+| `efm.rs` | `cider efm`'s half: the nodes and the load balancer, readiness (Postgres up *and* the agent answering its health endpoint), a status view of each node's role and where the load balancer routes, and `pour`, `ui` and `cli`. |
 | `state.rs` | Live cluster state via the `pgd` CLI's JSON output. |
 | `monitor.rs` | PGD Monitor probes (the web UI added in PGD 6.5). |
 | `term.rs` | Colour, glyphs, banner. |
@@ -65,7 +68,7 @@ more sense once you've seen the moving parts.
 Adding a verb means an arm and a function, nothing else. If every product
 would do it with the *same code*, the arm goes on `SharedVerb` in `main.rs`
 and the function in `lifecycle.rs`. Otherwise it goes on the product's own enum
-(`PgdVerb`, `LogicalVerb`) and the function in its module. `up` and `status`
+(`PgdVerb`, `LogicalVerb`, `EfmVerb`) and the function in its module. `up` and `status`
 exist for every product but are declared per product, because each implements
 them differently.
 
@@ -76,16 +79,11 @@ predates the second product: it separates host-level setup (`doctor`,
 `bootstrap`, which touch your Mac's DNS configuration) from cluster work, and
 it left room for `cider logical` without renaming a single existing command.
 
-`cider logical` is built. Two more candidates have been considered, neither
-built:
-
-- **EFM** is viable. `edb-efm54` is published for Debian 12 arm64, and a Virtual
-  IP works on this runtime (`--cap-add NET_ADMIN`; vmnet routes an address it did
-  not assign, verified from both the host and a peer container). EFM's
-  `primary.health.check.port` — 200 on the primary, 404 elsewhere — is probably a
-  better fit for a lab than a VIP.
-- **Patroni** — the popular open-source manager for streaming replication, with
-  etcd for consensus.
+`cider logical` and `cider efm` are built; *Failover Manager on this runtime*
+below records what EFM needed. One more candidate has been considered, not
+built: **Patroni**, the popular open-source manager for streaming replication,
+with etcd for consensus. Like EFM, its members address each other by IP, so it
+would rely on the stable addresses EFM does.
 
 ### Adding a second product
 
@@ -159,7 +157,7 @@ uses `host-1..3`, image `cider-press:latest`, and ports 5432-5434 and 6432-6457.
 ports 5442-5443. Volume names include the container name, so a shared volume
 prefix is fine.
 
-Of the seven things below, the logical pair still hits **#1**. A subscription's
+Of the eight things below, the logical pair still hits **#1**. A subscription's
 `CONNECTION` string is stored in the catalog and resolved again on every
 reconnect, so it needs the fully-qualified name for the same reason PGD's
 `--listen-addr` does. It also hits **#2**, because a subscription that connects
@@ -201,7 +199,7 @@ logical image the early test of `lib/node-common.sh` on Debian 13, so when PGD
 moves, the library will already be proven there. The cost, until PGD moves too,
 is that a change to the library has to be checked on both Debian 12 and 13.
 
-## Seven things that will bite you
+## Eight things that will bite you
 
 These each cost a debugging session. They are not in any documentation, and
 every one of them produced a cluster that looked fine and wasn't.
@@ -290,7 +288,68 @@ has no `--sysctl`. What works is `tcp_user_timeout=5000` in the connection
 string, a socket option the kernel enforces whatever API is used. With it,
 restarts took 7–8 seconds. PGD's own node connection strings already set
 `tcp_user_timeout`, which is why PGD never showed this. Any new product whose
-nodes connect to each other through libpq should set it too.
+nodes connect to each other through libpq should set it too. (The dropped first
+attempt is probably #8: a peer that has just started can't be reached for a few
+seconds. The timeout is still worth having.)
+
+**8. A new container's IPv6 address can't be used for its first few seconds.**
+A new IPv6 address is *tentative* while the kernel runs duplicate address
+detection, and a tentative address can't be used at all: connecting to it, even
+from the same node, fails with "No route to host". It lasted 2–5 seconds after a
+container started. EFM's agent hit it first: it starts a few seconds after the
+container, connects to its own database by its IPv6 address, and exited. So
+`write_peer_hosts`, which runs first on every start, now waits until the
+address's tentative flag (0x40 in `/proc/net/if_inet6`) clears before anything
+else starts, and logs how long it waited.
+
+## Failover Manager on this runtime
+
+What `cider efm` needed, beyond the stable addresses every product gets. Each
+came from a failure, and most would apply to running EFM in any container.
+
+- **Postgres can't be the container's main process.** Failover Manager stops,
+  starts and promotes the database itself; fencing a failed primary, say. If the
+  container's life were tied to Postgres, that would kill it. The node entrypoint
+  stays as PID 1 instead, as root. It runs Postgres as `postgres` and the agent as
+  `efm`, and on the stop signal it stops the agent first, then Postgres.
+- **The package doesn't pull in everything it needs.** It needs Java 11 or later,
+  per its docs, and `sudo`, which its own sudoers file assumes. The Dockerfile
+  installs both.
+- **`bind.address` and the `.nodes` file take an address, not a name,** as
+  `[ipv6]:port`. Each start writes them from `/etc/hosts`, so they're always this
+  start's addresses.
+- **The properties file must be readable by `postgres`,** not just `efm`. The
+  agent runs its database checks as `sudo -u postgres efm_db_functions …`, which
+  read it. The file holds no secret: the password comes from
+  `script.db.password` (new in 5.4), reading an `efm`-only file.
+- **`ping.server.ip` defaults to 8.8.8.8, which doesn't answer from inside these
+  containers, and an agent that can't reach it at startup exits.** Neither does
+  the network's gateway. It must not be a cluster node, so it's set to the load
+  balancer: on the same network, where clients come from, and started first.
+  That's why extras start before nodes.
+- **Tools EFM runs as `postgres` need a `.pgpass`.** It runs `pg_rewind` and
+  `pg_basebackup` through `sudo -u postgres`, which strips `PGPASSWORD` from the
+  environment. Without the file, rebuilding a failed primary failed with "no
+  password supplied".
+- **`wal_keep_size = 512MB`.** After a failover the remaining standby is
+  repointed at the new primary. With the default of 0 and no replication slot,
+  the new primary had already removed WAL the standby needed, and it retried
+  "requested WAL segment has already been removed" for ever.
+- **A node being provisioned clones whichever node is primary *now*,** found by
+  asking the others' health endpoints. Otherwise rebuilding `maeve-1` after a
+  failover would create a second primary beside the promoted one.
+- **No virtual IP.** An IPv4 VIP moves instantly, because EFM sends a gratuitous
+  ARP, but the runtime was seen handing the VIP's address to a new container,
+  then wrapping round to `.2`. An IPv6 VIP is safe from that, but EFM only
+  announces IPv4 VIPs, so peers and macOS kept using the old node for 40
+  seconds. The load balancer polling the 5.4 health endpoint has neither
+  problem.
+
+Measured with the defaults: `up` in about 40 seconds; a hard kill of the primary
+detected in about 60 (Failover Manager's default timing); promotion and the load
+balancer following within a few seconds after that; the old primary rebuilt and
+rejoined automatically; a whole-cluster `stop` and `start` healthy in 7 seconds
+with no false failover.
 
 ## Deliberate decisions
 
@@ -326,6 +385,12 @@ but no cluster has been stood up on either. Treat them as plausible, not proven.
 run end to end: the printed wiring SQL pasted as-is, replication in both
 directions, no echo loop, and a forced `insert_exists` conflict showing in
 `status`. Other `CIDER_LOGICAL_PG_MAJOR` values have not been tried.
+
+`cider efm` on its defaults (EFM 5.4, PGE 18, Debian 12) has been built and run
+end to end: writes through the load balancer from macOS reaching both standbys,
+a failover with a client writing throughout, the old primary rejoining by
+itself, and a whole-cluster restart. Other `CIDER_EFM_VERSION` values have not
+been tried; anything before 5.4 lacks the health endpoint.
 
 It does **not** cover standing up a cluster — that needs Apple silicon,
 macOS 26+, the runtime, and a subscription token. CI green means the logic is

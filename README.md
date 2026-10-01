@@ -22,9 +22,9 @@ rebuilt for a runtime with no `compose`.
 > [!IMPORTANT]
 > cider-press is **not** endorsed or supported by EnterpriseDB, and is not covered 
 > by any EDB support agreement or SLA. Please don't raise EDB support tickets about it 
-> , open an issue here instead. PGD itself is commercial software: you need your own valid
-> EDB subscription, and your use of the packages it installs is governed by your
-> agreement with EDB, not by this repository's licence.
+> , open an issue here instead. PGD and Failover Manager are commercial software: you need
+> your own valid EDB subscription, and your use of the packages they install is governed by
+> your agreement with EDB, not by this repository's licence.
 
 **Contents** · [What this is for](#what-this-is-for) ·
 [Why Apple container](#why-apple-container) · [Expanding](#could-this-do-more-than-pgd) ·
@@ -34,6 +34,7 @@ rebuilt for a runtime with no `compose`.
 [Web UI](#5-connect-to-the-web-ui) · [Tear down](#6-tear-down) ·
 [Pooling](#connection-pooling) ·
 [Logical replication](#cider-logical-core-postgresql-logical-replication) ·
+[Failover Manager](#cider-efm-edb-failover-manager) ·
 [Commands](#command-reference) ·
 [Status](#how-cider-pgd-status-reads-the-cluster) · [DNS](#the-dns-part-the-only-genuinely-tricky-bit) ·
 [Configuration](#configuration) · [Token safety](#about-that-subscription-token) ·
@@ -62,32 +63,25 @@ or [Hybrid Manager](https://www.enterprisedb.com/docs/pgd/latest/deploying/deplo
 
 ## Could this do more than PGD?
 
-It already does one more thing:
-[**`cider logical`**](#cider-logical-core-postgresql-logical-replication), a
-pair of community PostgreSQL nodes for wiring up logical replication by hand.
-It needs no EDB subscription.
+It already does two more:
+
+- [**`cider logical`**](#cider-logical-core-postgresql-logical-replication): a
+  pair of community PostgreSQL nodes for wiring up logical replication by hand.
+  It needs no EDB subscription.
+- [**`cider efm`**](#cider-efm-edb-failover-manager): a primary and two standbys
+  under EDB Failover Manager, behind a load balancer that follows the primary
+  through a failover. The classic counterpart to PGD's active-active.
 
 Commands are grouped as `cider <product> <verb>`, and the lifecycle underneath
-(start, wait, retry, stop, tear down) is shared, so another stack would be a new
-group reusing both (`cider efm up`, `cider patroni status`) rather than a
-rewrite. [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-second-product) describes
-how `cider logical` was added.
+(start, wait, retry, stop, tear down) is shared, so another stack is a new group
+reusing both rather than a rewrite.
+[ARCHITECTURE.md](ARCHITECTURE.md#adding-a-second-product) describes how a
+product is added.
 
-Two more candidates, neither built and neither promised:
-
-- **[EDB Failover Manager](https://www.enterprisedb.com/docs/efm/latest/)** —
-  streaming replication with automatic failover, the classic counterpart to
-  PGD's active-active. Evaluated as far as feasibility: `edb-efm54` is published
-  for Debian 12 arm64, and EFM's Virtual IP works on this runtime (verified — an
-  address added under `--cap-add NET_ADMIN` is reachable from both macOS and a
-  peer container, because vmnet routes addresses it did not assign). EFM also
-  exposes an HTTP endpoint that answers 200 on the primary and 404 elsewhere,
-  which suits a lab better than a VIP.
-- **[Patroni](https://patroni.readthedocs.io/)** — the same failover problem
-  solved in the open-source world, with etcd for consensus.
-
-Whether any of that happens depends on whether the PGD quickstart proves worth
-using first. If you would find one of them useful, say so in an issue. 
+One more candidate, not built and not promised:
+**[Patroni](https://patroni.readthedocs.io/)**, the same failover problem solved
+in the open-source world, with etcd for consensus. If you'd find it useful, say
+so in an issue.
 
 ## Why Apple container
 
@@ -593,6 +587,107 @@ Nothing written afterwards reaches the other node until the conflict is resolved
 by hand. To start again from nothing, run
 `./cider logical pomace -y && ./cider logical build && ./cider logical up`.
 
+## `cider efm`: EDB Failover Manager
+
+A primary and two standbys of EDB Postgres Extended 18 on streaming replication,
+each watched by an [EDB Failover Manager](https://www.enterprisedb.com/docs/efm/latest/)
+5.4 agent, plus `maeve-lb`, an HAProxy load balancer that always reaches the
+primary. Kill the primary and watch a standby take over, the load balancer
+follow it, and the old primary rebuild itself and rejoin as a standby. Like PGD,
+it needs your EDB subscription token to build.
+
+```bash
+./cider efm build
+```
+
+```bash
+./cider efm up
+```
+
+`up` takes about 40 seconds: the load balancer, then `maeve-1` as the primary,
+then `maeve-2` and `maeve-3` cloned from it.
+
+```
+  NODE        POSTGRES    EFM AGENT     HEALTH
+  maeve-1     primary     primary       200
+  maeve-2     standby     not primary   404
+  maeve-3     standby     not primary   404
+
+  load balancer → maeve-1   (127.0.0.1:5450)
+```
+
+### How clients find the primary
+
+Failover Manager 5.4 added an HTTP health endpoint to every agent
+(`primary.health.check.port`): it answers **200 on the primary and 404
+everywhere else**, for a load balancer to poll. HAProxy asks every node once a
+second, so its one port reaches whichever node is primary, and follows it after
+a failover. It plays the part PGD's Connection Manager plays for the write
+leader.
+
+```bash
+PGPASSWORD=secret psql -h 127.0.0.1 -p 5450 -U postgres efmdb
+```
+
+`./cider efm pour` does the same from inside the load balancer's container, out
+of reach of macOS networking. `./cider efm ui` opens HAProxy's stats page at
+<http://127.0.0.1:7880/>, which shows which node is primary right now. The
+primary is the one marked UP. The standbys show DOWN, which only means "not the
+primary". Each node's own endpoint is published too (`:7881`, `:7882`, `:7883`),
+so you can watch the 200 move:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7881/
+```
+
+### Trying a failover
+
+Stop the primary's database the hard way, from a shell on the node:
+
+```bash
+./cider efm shell 1
+```
+
+```bash
+su postgres -c 'pg_ctl -D $PGDATA -m immediate stop'
+```
+
+Then watch `./cider efm status` from the Mac. What happened, measured:
+
+| after | |
+|---|---|
+| ~60 s | Failover Manager declares the primary failed. That's its default detection timing (`local.period`, `local.timeout` and friends), tunable in its properties |
+| +4 s | `maeve-2` is promoted, answers 200, and the load balancer switches to it within a second. `maeve-3` is repointed at it |
+| seconds later | `maeve-1` rebuilds itself as a standby of `maeve-2` and rejoins |
+
+A client writing through `:5450` every half second saw its writes fail for that
+minute, then carry on against `maeve-2` through the same address. Failover
+Manager's notifications go to each node's log (`./cider efm logs 2`), and its own
+view is one command away:
+
+```bash
+./cider efm cli cluster-status maeve
+```
+
+The automatic rejoin is Failover Manager's `auto.rewind` and `auto.basebackup`,
+which cider turns on. It tries `pg_rewind` first and falls back to
+`pg_basebackup`. After a hard crash like the one above, `pg_rewind` declines
+because the old primary needs crash recovery first, so expect the
+`pg_basebackup` path. Set `CIDER_EFM_AUTO_REJOIN=off` to see the alternative: the
+failed primary stays fenced, and Failover Manager leaves a `recovery.conf` in its
+data directory so it can't come back as a second primary.
+
+### Why no virtual IP
+
+A VIP was the first idea, and both kinds were tested. An **IPv4** VIP moves
+instantly, because Failover Manager announces it with a gratuitous ARP. But the
+runtime hands out IPv4 addresses in sequence and doesn't know about the VIP. It
+was seen giving the VIP's address to a new container, then wrapping round to
+`.2`, so sooner or later a VIP collides. An **IPv6** VIP is safe from that, but
+Failover Manager doesn't announce IPv6 VIPs, so clients kept using the old node
+for 40 seconds after every move. The load balancer has neither problem, and
+everything it publishes is on `127.0.0.1`, out of a VPN's way.
+
 ## Command reference
 
 Commands are `cider <product> <verb>`, matching the grammar of EDB's own CLIs
@@ -647,6 +742,23 @@ and one runtime.
 `containers`, `stop`, `start`, `down`, `pomace`, `shell` and `logs` work exactly
 as they do for `pgd`. `[node]` takes `2` or `dolores-2`. There's no `pour`, `cli`
 or `ui`: no leader to route to, no product CLI and no web UI.
+
+**Failover Manager** — `cider efm …`
+
+| | |
+|---|---|
+| `cider efm build [--no-cache]` | Build the image the nodes and the load balancer share. Needs `EDB_SUBSCRIPTION_TOKEN` |
+| `cider efm up` / `press` | Create the load balancer, the primary and the standbys |
+| `cider efm status` / `ps` | Each node's role, and where the load balancer is routing |
+| `cider efm endpoints` | Every published port, and how to try a failover |
+| `cider efm ui` / `web` | Open HAProxy's stats page: which node is primary |
+| `cider efm pour` | psql to the primary through the load balancer |
+| `cider efm psql [node] [args…]` | psql straight to a node (default 1) |
+| `cider efm cli <args…>` | Failover Manager's `efm` command, e.g. `cli cluster-status maeve` |
+
+`containers`, `stop`, `start`, `down`, `pomace`, `shell` and `logs` work as they
+do for `pgd`, and include the load balancer. `[node]` takes `2`, `maeve-2`, or
+`lb` for the load balancer.
 
 ---
 
@@ -770,6 +882,18 @@ both can run at once:
 
 Its image is `cider-press-logical:latest`, and its database is `demo`.
 
+`cider efm up` creates four more:
+
+| container | role | volume | postgres | health endpoint |
+|---|---|---|---|---|
+| `maeve-lb` | HAProxy: always the primary | — | **5450** | stats page **7880** |
+| `maeve-1` | primary, at first | `cider-press-maeve-1` | 5451 | 7881 |
+| `maeve-2` | standby | `cider-press-maeve-2` | 5452 | 7882 |
+| `maeve-3` | standby | `cider-press-maeve-3` | 5453 | 7883 |
+
+Its image is `cider-press-efm:latest`, its database `efmdb`, and Failover
+Manager's cluster name is `maeve`.
+
 ---
 
 ## Configuration
@@ -825,6 +949,17 @@ be confused with PGD's. The shared ones above (`CIDER_DOMAIN`, `CIDER_PASSWORD`,
 | `CIDER_LOGICAL_DEBIAN_VERSION` | `13` | Separate from PGD's `DEBIAN_VERSION` (12): PGDG supports new Debian releases months before EDB does |
 | `CIDER_LOGICAL_DB` | `demo` | The database both nodes create |
 | `CIDER_LOGICAL_PG_PORT_BASE` | `5442` | `dolores-1` gets this, `dolores-2` the next |
+
+`cider efm`'s settings are prefixed `CIDER_EFM_`, and the same shared ones apply.
+
+| Variable | Default | |
+|---|---|---|
+| `CIDER_EFM_VERSION` | `5.4` | Failover Manager version. 5.4 is the first with the health endpoint the load balancer needs |
+| `CIDER_EFM_PG_MAJOR` | `18` | EDB Postgres Extended major version |
+| `CIDER_EFM_AUTO_REJOIN` | `on` | A failed primary rebuilds itself as a standby. `off` leaves it fenced |
+| `CIDER_EFM_DB` | `efmdb` | The database Failover Manager monitors |
+| `CIDER_EFM_PORT_BASE` | `5450` | The load balancer; node *i* is on the port *i* above it |
+| `CIDER_EFM_WEB_PORT_BASE` | `7880` | The stats page; node *i*'s health endpoint is *i* above it |
 
 ---
 
@@ -1034,6 +1169,7 @@ cider-press/
 │   ├── lifecycle.rs      # what every product shares: start, wait, stop, teardown
 │   ├── pgd.rs            # PGD's own: containers, readiness, endpoints, web UI
 │   ├── logical.rs        # cider logical: the pair, its status, the wiring SQL
+│   ├── efm.rs            # cider efm: the nodes, the load balancer, status, failover
 │   ├── state.rs          # live cluster state via `pgd -o json`
 │   ├── monitor.rs        # PGD Monitor probes
 │   └── term.rs           # colour, glyphs, banner
@@ -1042,6 +1178,9 @@ cider-press/
 │   ├── entrypoint.sh     # per-node provisioning, join, monitor enablement
 │   ├── logical.Dockerfile      # Debian 13 + PGDG PostgreSQL 18, no token
 │   ├── logical-entrypoint.sh   # initdb, wal_level = logical, the demo database
+│   ├── efm.Dockerfile          # Debian 12 + PGE 18 + EFM 5.4 + HAProxy, token as a secret
+│   ├── efm-entrypoint.sh       # provision, configure EFM, supervise postgres and the agent
+│   ├── efm-lb-entrypoint.sh    # HAProxy, polling every agent's health endpoint
 │   └── lib/
 │       └── node-common.sh  # helpers every node image shares: DNS wait, pg_hba, listen
 ├── .env.example

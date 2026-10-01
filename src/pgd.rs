@@ -38,6 +38,7 @@ pub fn deployment(cfg: &Config) -> Deployment<'_> {
         domain: &cfg.domain,
         dockerfile: "image/Dockerfile",
         ready_timeout: cfg.ready_timeout,
+        extras: vec![],
     }
 }
 

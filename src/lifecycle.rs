@@ -85,9 +85,40 @@ pub struct Deployment<'a> {
     pub dockerfile: &'static str,
     /// How long `up` waits for one node to become ready, in seconds.
     pub ready_timeout: u64,
+    /// Containers that are part of the deployment but are not numbered nodes:
+    /// no volume and no data. EFM's load balancer is one. They are
+    /// infrastructure the nodes may depend on — EFM's agents ping the load
+    /// balancer at startup to check they are not cut off — so they start
+    /// before the nodes and stop after them. `stop`, `start`, `down`, `pomace`
+    /// and `containers` include them; nothing that counts nodes does.
+    pub extras: Vec<String>,
 }
 
 impl Deployment<'_> {
+    /// The container a `[node]` argument names: an extra by its full or short
+    /// name ("maeve-lb" or "lb"), otherwise a node as [`node_index`] reads it.
+    ///
+    /// [`node_index`]: Deployment::node_index
+    pub fn container_for(&self, arg: Option<&str>) -> String {
+        if let Some(a) = arg.map(str::trim) {
+            let full = format!("{}{a}", self.host_prefix);
+            if let Some(extra) = self.extras.iter().find(|e| **e == a || **e == full) {
+                return extra.clone();
+            }
+        }
+        self.host_name(self.node_index(arg))
+    }
+
+    /// Every container in the deployment, in the order they start: the extras,
+    /// then the nodes. They stop in the reverse order.
+    pub fn all_containers(&self) -> Vec<String> {
+        self.extras
+            .iter()
+            .cloned()
+            .chain((1..=self.nodes).map(|i| self.host_name(i)))
+            .collect()
+    }
+
     /// Container name for node `i`, e.g. "host-1".
     pub fn host_name(&self, i: u16) -> String {
         config::container_name(self.host_prefix, i)
@@ -378,11 +409,14 @@ fn eui64(m: [u8; 6]) -> String {
     )
 }
 
-/// `CIDER_PEERS` for this deployment: every node, itself included, as
-/// `<fqdn>=<interface id>`, comma-separated. The same list for every node.
+/// `CIDER_PEERS` for this deployment: every container, itself included, as
+/// `<fqdn>=<interface id>`, comma-separated. The same list for every one of
+/// them. Extras are in it too, so nodes can reach them by name: EFM's agents
+/// ping the load balancer.
 pub fn peers_env(d: &Deployment) -> String {
-    (1..=d.nodes)
-        .map(|i| format!("{}={}", d.host_fqdn(i), interface_id(&d.host_name(i))))
+    d.all_containers()
+        .iter()
+        .map(|name| format!("{name}.{}={}", d.domain, interface_id(name)))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -393,8 +427,13 @@ pub fn peers_env(d: &Deployment) -> String {
 /// the container exited (its entrypoint gave up), or it is still running but
 /// not yet ready. Only the last one is worth waiting on.
 fn wait_for_node(d: &Deployment, i: u16, ready: &impl Fn(u16) -> bool) -> Result<()> {
-    let name = d.host_name(i);
-    let fqdn = d.host_fqdn(i);
+    wait_for(d, &d.host_name(i), &d.host_fqdn(i), &|| ready(i))
+}
+
+/// Block until `ready` says container `name` is ready, or fail with its logs.
+/// [`wait_for_node`] for any container, including a deployment's extras.
+pub fn wait_for(d: &Deployment, name: &str, fqdn: &str, ready: &impl Fn() -> bool) -> Result<()> {
+    let (name, fqdn) = (name.to_string(), fqdn.to_string());
     print!("  waiting for {name} ");
     std::io::stdout().flush().ok();
     let mut waited = 0u64;
@@ -416,7 +455,7 @@ fn wait_for_node(d: &Deployment, i: u16, ready: &impl Fn(u16) -> bool) -> Result
             }
             container::State::Running => {}
         }
-        if ready(i) {
+        if ready() {
             println!(" {}", term::green("ready"));
             return Ok(());
         }
@@ -486,7 +525,7 @@ pub fn start_and_wait(
 /// Raw `container ls` and `volume list`, filtered to this deployment's own
 /// containers and volumes.
 pub fn containers_table(d: &Deployment) {
-    let containers: Vec<String> = (1..=d.nodes).map(|i| d.host_name(i)).collect();
+    let containers = d.all_containers();
     let volumes: Vec<String> = (1..=d.nodes).map(|i| d.volume_name(i)).collect();
 
     term::info("containers");
@@ -527,10 +566,10 @@ fn own_rows<'a>(listing: &'a str, names: &[String]) -> Vec<&'a str> {
 
 // --- lifecycle -------------------------------------------------------------
 
-/// Stop the node containers, leaving them and their data intact.
+/// Stop the containers, leaving them and their data intact: in the reverse of
+/// the order they start, so nodes stop before the extras they depend on.
 pub fn stop(d: &Deployment) -> Result<()> {
-    for i in 1..=d.nodes {
-        let name = d.host_name(i);
+    for name in d.all_containers().into_iter().rev() {
         if container::state(&name) == container::State::Running {
             if stop_node(&name) {
                 term::ok(&format!("stopped {name}"));
@@ -549,8 +588,7 @@ pub fn stop(d: &Deployment) -> Result<()> {
 /// to report `Unreachable` with no explanation.
 pub fn start(d: &Deployment) -> Result<()> {
     let mut started = 0;
-    for i in 1..=d.nodes {
-        let name = d.host_name(i);
+    for name in d.all_containers() {
         match container::state(&name) {
             container::State::Stopped => {
                 if container::quiet_ok(&["start", &name]) {
@@ -582,8 +620,7 @@ pub fn start(d: &Deployment) -> Result<()> {
 pub fn down(d: &Deployment) -> Result<()> {
     term::banner_for(d.title);
     term::info("removing containers (volumes and image are kept)");
-    for i in 1..=d.nodes {
-        let name = d.host_name(i);
+    for name in d.all_containers().into_iter().rev() {
         match container::state(&name) {
             container::State::Absent => println!("  {}", term::dim(&format!("{name} not present"))),
             _ => {
@@ -622,6 +659,9 @@ pub fn pomace(cfg: &Config, d: &Deployment, assume_yes: bool, remove_dns: bool) 
             term::dim("(all its data)")
         );
     }
+    for name in &d.extras {
+        println!("  container {name:<10} {}", term::dim("(no data)"));
+    }
     println!("  image     {}", d.image);
     println!();
     if remove_dns {
@@ -649,8 +689,12 @@ pub fn pomace(cfg: &Config, d: &Deployment, assume_yes: bool, remove_dns: bool) 
         }
     }
 
-    for i in 1..=d.nodes {
-        let name = d.host_name(i);
+    for name in d
+        .extras
+        .iter()
+        .cloned()
+        .chain((1..=d.nodes).map(|i| d.host_name(i)))
+    {
         if container::exists(&name) {
             // The volume is about to be deleted, so recovery cost is moot, but
             // a fast shutdown still returns sooner than waiting out the kill
@@ -703,6 +747,7 @@ mod tests {
             domain: "cider",
             dockerfile: "image/Dockerfile",
             ready_timeout: 420,
+            extras: vec![],
         }
     }
 
@@ -772,6 +817,24 @@ mod tests {
             assert_eq!(first & 0b01, 0, "{name}: must be unicast");
             assert_eq!(first & 0b10, 0b10, "{name}: must be locally administered");
         }
+    }
+
+    // Extras start first and stop last, and are resolvable by the nodes.
+    #[test]
+    fn extras_start_first_and_are_in_the_peer_list() {
+        let d = Deployment {
+            group: "efm",
+            host_prefix: "maeve-",
+            nodes: 2,
+            extras: vec!["maeve-lb".into()],
+            ..pgd_like()
+        };
+        assert_eq!(d.all_containers(), ["maeve-lb", "maeve-1", "maeve-2"]);
+        assert!(peers_env(&d).starts_with(&format!("maeve-lb.cider={}", interface_id("maeve-lb"))));
+        assert_eq!(d.container_for(Some("lb")), "maeve-lb");
+        assert_eq!(d.container_for(Some("maeve-lb")), "maeve-lb");
+        assert_eq!(d.container_for(Some("2")), "maeve-2");
+        assert_eq!(d.container_for(None), "maeve-1");
     }
 
     #[test]

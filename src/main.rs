@@ -7,6 +7,7 @@
 //! - [`container`] the only module that shells out to `container` or parses its output
 //! - [`doctor`]    preflight checks, in the order they matter
 //! - [`bootstrap`] one-time host setup: the container DNS domain and macOS resolver
+//! - [`efm`]       `cider efm`: EDB Failover Manager, a primary, two standbys and HAProxy
 //! - [`lifecycle`] what every product shares: build, start-and-wait, stop, teardown
 //! - [`logical`]   `cider logical`: a community PostgreSQL pair for logical replication
 //! - [`pgd`]       PGD's half of the verbs: its containers, readiness, endpoints, web UI
@@ -32,6 +33,7 @@ mod bootstrap;
 mod config;
 mod container;
 mod doctor;
+mod efm;
 mod lifecycle;
 mod logical;
 mod monitor;
@@ -75,6 +77,52 @@ enum Top {
     /// Two community PostgreSQL nodes, for logical replication you wire up
     #[command(subcommand)]
     Logical(LogicalVerb),
+    /// EDB Failover Manager — a primary, two standbys and a load balancer
+    #[command(subcommand)]
+    Efm(EfmVerb),
+}
+
+/// Everything you can do to the EFM cluster.
+///
+/// `pour` goes through the load balancer, which follows the primary, as `pgd
+/// pour` goes through Connection Manager. `ui` is HAProxy's stats page. `cli`
+/// is Failover Manager's own `efm` command.
+#[derive(Subcommand)]
+enum EfmVerb {
+    /// Build the image (needs EDB_SUBSCRIPTION_TOKEN)
+    Build {
+        /// Rebuild without using cached layers
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// Create the primary, the standbys and the load balancer
+    #[command(alias = "press")]
+    Up,
+    /// Each node's role, and where the load balancer is routing
+    #[command(alias = "ps")]
+    Status,
+    /// Every published port, and how to try a failover
+    Endpoints,
+    /// Open HAProxy's stats page: which node is primary
+    #[command(alias = "web")]
+    Ui,
+    /// psql to the primary through the load balancer
+    Pour,
+    /// psql directly to a node (default 1)
+    Psql {
+        /// Node, as "2" or "maeve-2"
+        node: Option<String>,
+        /// Extra arguments passed to psql
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Failover Manager's efm command, e.g. cider efm cli cluster-status maeve
+    Cli {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(flatten)]
+    Shared(SharedVerb),
 }
 
 /// Verbs every product has *and implements the same way* — one function in
@@ -231,6 +279,28 @@ fn run() -> Result<()> {
         Top::Bootstrap { yes } => bootstrap::run(&cfg, yes),
         Top::Pgd(verb) => run_pgd(&cfg, verb),
         Top::Logical(verb) => run_logical(&cfg, verb),
+        Top::Efm(verb) => run_efm(&cfg, verb),
+    }
+}
+
+/// Dispatch an EFM verb. One arm per [`EfmVerb`].
+fn run_efm(cfg: &Config, verb: EfmVerb) -> Result<()> {
+    let d = efm::deployment(cfg);
+    match verb {
+        EfmVerb::Build { no_cache } => efm::build(cfg, no_cache),
+        EfmVerb::Up => efm::up(cfg),
+        EfmVerb::Status => efm::status(cfg),
+        EfmVerb::Endpoints => {
+            efm::endpoints(cfg);
+            Ok(())
+        }
+        EfmVerb::Ui => efm::ui(cfg),
+        EfmVerb::Pour => efm::pour(cfg),
+        EfmVerb::Psql { node, args } => {
+            psql(cfg, &d, &cfg.efm.user, &cfg.efm.db, node.as_deref(), &args)
+        }
+        EfmVerb::Cli { args } => efm::cli(cfg, &args),
+        EfmVerb::Shared(verb) => run_shared(cfg, &d, verb),
     }
 }
 
@@ -291,8 +361,7 @@ fn run_shared(cfg: &Config, d: &Deployment, verb: SharedVerb) -> Result<()> {
         SharedVerb::Pomace { yes, dns } => lifecycle::pomace(cfg, d, yes, dns),
         SharedVerb::Shell { node } => shell(cfg, d, node.as_deref()),
         SharedVerb::Logs { node, args } => {
-            let i = d.node_index(node.as_deref());
-            container::logs(&d.host_name(i), &args)
+            container::logs(&d.container_for(node.as_deref()), &args)
         }
     }
 }
@@ -401,8 +470,10 @@ fn pgd_cli(cfg: &Config, extra: &[String]) -> Result<()> {
 
 /// An interactive bash shell inside a node container, for any product.
 fn shell(cfg: &Config, d: &Deployment, node: Option<&str>) -> Result<()> {
-    let i = d.node_index(node);
-    let name = require_running(d, i)?;
+    let name = d.container_for(node);
+    if container::state(&name) != container::State::Running {
+        anyhow::bail!("{name} is not running — run: {}", d.hint("up"));
+    }
     container::exec_interactive(
         &name,
         &[("PGPASSWORD", &cfg.password)],
@@ -510,6 +581,32 @@ mod tests {
             "cider logical logs 2",
         ] {
             assert!(matches!(parse(line), Top::Logical(_)), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_efm_verb_and_alias_parses() {
+        for line in [
+            "cider efm build --no-cache",
+            "cider efm up",
+            "cider efm press",
+            "cider efm status",
+            "cider efm ps",
+            "cider efm endpoints",
+            "cider efm ui",
+            "cider efm web",
+            "cider efm pour",
+            "cider efm psql 2 -c select",
+            "cider efm cli cluster-status maeve",
+            "cider efm containers",
+            "cider efm stop",
+            "cider efm start",
+            "cider efm down",
+            "cider efm pomace -y",
+            "cider efm shell lb",
+            "cider efm logs lb",
+        ] {
+            assert!(matches!(parse(line), Top::Efm(_)), "{line}");
         }
     }
 

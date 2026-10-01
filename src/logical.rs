@@ -27,6 +27,7 @@ pub fn deployment(cfg: &Config) -> Deployment<'_> {
         domain: &cfg.domain,
         dockerfile: "image/logical.Dockerfile",
         ready_timeout: cfg.ready_timeout,
+        extras: vec![],
     }
 }
 
@@ -439,6 +440,7 @@ mod tests {
             domain: "cider",
             dockerfile: "image/logical.Dockerfile",
             ready_timeout: 420,
+            extras: vec![],
         }
     }
 

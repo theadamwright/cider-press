@@ -64,7 +64,7 @@ jobs:
         # shared between the two (CIDER_GROUP, CIDER_STATE_DIR) are not flagged
         # as unused or unassigned. It does not catch a call to a function the
         # library no longer defines; only a real `cider pgd up` does that.
-        run: shellcheck -x --severity=warning image/entrypoint.sh image/logical-entrypoint.sh image/lib/node-common.sh cider
+        run: shellcheck -x --severity=warning image/entrypoint.sh image/logical-entrypoint.sh image/efm-entrypoint.sh image/efm-lb-entrypoint.sh image/lib/node-common.sh cider
 
   secrets:
     name: no committed credentials

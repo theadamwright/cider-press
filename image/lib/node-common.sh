@@ -65,6 +65,26 @@ write_peer_hosts() {
     fi
     local prefix="${hex:0:4}:${hex:4:4}:${hex:8:4}:${hex:12:4}"
 
+    # A new IPv6 address is *tentative* for a few seconds after the container
+    # starts, while the kernel runs duplicate address detection, and cannot be
+    # used at all: connecting to it, even from this node, fails with "No route
+    # to host". Measured at 2-5s. Wait it out here, before anything starts, so
+    # nothing on this node or dialling it lands in that window -- Failover
+    # Manager's agent, connecting to its own database by this address, exited
+    # when it did. The tentative flag is 0x40 in /proc/net/if_inet6.
+    local flags waited=0
+    while :; do
+        flags="$(awk -v a="$hex" '$1 == a {print $5; exit}' /proc/net/if_inet6 2>/dev/null)"
+        [ $(( 0x${flags:-00} & 0x40 )) -eq 0 ] && break
+        if [ "$waited" -ge 100 ]; then
+            log "IPv6 address still tentative after 10s; continuing anyway"
+            break
+        fi
+        sleep 0.1
+        waited=$(( waited + 1 ))
+    done
+    [ "$waited" -gt 0 ] && log "waited $(( waited / 10 )).$(( waited % 10 ))s for this node's IPv6 address to become usable"
+
     # Replace, never append twice: keep the runtime's own lines, drop any of
     # ours from an earlier start, then add the current set.
     local tmp="/etc/hosts.cider-press" entry count=0
