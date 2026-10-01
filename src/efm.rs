@@ -361,7 +361,7 @@ fn wait_for_lb_target(cfg: &Config) -> Result<()> {
 ///
 /// The two views should agree — a node that is not in recovery answers 200 —
 /// and during a failover watching them disagree for a moment is the
-/// interesting part. `cider efm cli cluster-status maeve` shows Failover
+/// interesting part. `cider efm cli cluster-status` shows Failover
 /// Manager's own, fuller view.
 pub fn status(cfg: &Config) -> Result<()> {
     let d = deployment(cfg);
@@ -500,7 +500,14 @@ pub fn endpoints(cfg: &Config) {
             term::dim("# then the old primary rewinds itself and rejoins as a standby")
         );
     }
-    println!("  ./cider efm cli cluster-status {}", cfg.efm.cluster_name);
+    println!(
+        "  ./cider efm cli cluster-status      {}",
+        term::dim("# Failover Manager's own view")
+    );
+    println!(
+        "  ./cider efm cli replication-status  {}",
+        term::dim("# each standby's upstream and lag")
+    );
 }
 
 /// Open HAProxy's stats page, having checked it answers.
@@ -556,14 +563,42 @@ pub fn pour(cfg: &Config) -> Result<()> {
     container::exec_interactive(&lb, &[("PGPASSWORD", &cfg.password)], &cmd)
 }
 
-/// Run Failover Manager's own CLI on the first running node, e.g.
-/// `cider efm cli cluster-status maeve`.
+/// Run Failover Manager's own CLI on the first running node, with the cluster
+/// name filled in: `cider efm cli cluster-status` runs
+/// `efm cluster-status maeve`, as `cider pgd cli` fills in the connection for
+/// the PGD CLI.
+///
+/// Commands that act on the node they run on (`create-standby`,
+/// `node-status-json`, `resume`) act on that first running node. For another
+/// node, `cider efm shell 2` and run `efm` there.
 pub fn cli(cfg: &Config, args: &[String]) -> Result<()> {
     let d = deployment(cfg);
     let i = lifecycle::first_running(&d)?;
     let mut cmd: Vec<String> = vec![format!("/usr/edb/efm-{}/bin/efm", cfg.efm.efm_version)];
-    cmd.extend(args.iter().cloned());
+    cmd.extend(with_cluster_name(&cfg.efm.cluster_name, args));
     container::exec_interactive(&d.host_name(i), &[], &cmd)
+}
+
+/// `efm`'s arguments with the cluster name inserted where it belongs.
+///
+/// Every `efm` command takes the form `efm <command> <cluster_name> [...]`, so
+/// the name goes straight after the command — unless it is already there, or
+/// a properties-file path is (which `efm` also accepts in its place). With no
+/// command, or a leading option such as `--help`, nothing is added and `efm`
+/// prints its own usage.
+fn with_cluster_name(cluster: &str, args: &[String]) -> Vec<String> {
+    let Some((command, rest)) = args.split_first() else {
+        return Vec::new();
+    };
+    let named = rest
+        .first()
+        .is_some_and(|a| a == cluster || a.contains('/') || a.ends_with(".properties"));
+    if command.starts_with('-') || named {
+        return args.to_vec();
+    }
+    let mut out = vec![command.clone(), cluster.to_string()];
+    out.extend(rest.iter().cloned());
+    out
 }
 
 #[cfg(test)]
@@ -596,6 +631,28 @@ mod tests {
                 .map(|(n, _)| n.as_str()),
             Some("maeve-2")
         );
+    }
+
+    #[test]
+    fn the_cluster_name_is_filled_in_after_the_command() {
+        let args = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+        let run = |s: &str| with_cluster_name("maeve", &args(s)).join(" ");
+        assert_eq!(run("cluster-status"), "cluster-status maeve");
+        assert_eq!(run("replication-status"), "replication-status maeve");
+        assert_eq!(
+            run("set-priority fd68::1 2"),
+            "set-priority maeve fd68::1 2"
+        );
+        assert_eq!(run("promote -switchover"), "promote maeve -switchover");
+        // Already named, by cluster or by properties file: left alone.
+        assert_eq!(run("cluster-status maeve"), "cluster-status maeve");
+        assert_eq!(
+            run("cluster-status /etc/edb/efm-5.4/maeve.properties"),
+            "cluster-status /etc/edb/efm-5.4/maeve.properties"
+        );
+        // No command, or an option: efm's own usage.
+        assert_eq!(run(""), "");
+        assert_eq!(run("--help"), "--help");
     }
 
     #[test]

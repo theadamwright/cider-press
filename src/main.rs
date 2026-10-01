@@ -116,7 +116,7 @@ enum EfmVerb {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run Failover Manager's efm command, e.g. cider efm cli cluster-status maeve
+    /// Run Failover Manager's efm command, e.g. cider efm cli cluster-status
     Cli {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -597,7 +597,7 @@ mod tests {
             "cider efm web",
             "cider efm pour",
             "cider efm psql 2 -c select",
-            "cider efm cli cluster-status maeve",
+            "cider efm cli cluster-status",
             "cider efm containers",
             "cider efm stop",
             "cider efm start",

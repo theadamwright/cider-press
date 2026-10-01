@@ -11,8 +11,9 @@
          pressed on Apple's container runtime
 ```
 
-A from-scratch local lab for **EDB Postgres Distributed 6.5.0+** on Apple silicon,
-built on [`apple/container`](https://github.com/apple/container) instead of Docker
+A from-scratch local lab for **EDB Postgres Distributed 6.5.0+**, **EDB Failover
+Manager 5.4** and **core PostgreSQL logical replication** on Apple silicon, built
+on [`apple/container`](https://github.com/apple/container) instead of Docker
 Desktop. Build the image, press a cluster, tear it all down again — one small
 script, no daemon you have to remember to quit.
 
@@ -44,8 +45,8 @@ rebuilt for a runtime with no `compose`.
 
 ## What this is for
 
-Getting a working PGD cluster in front of you in a few minutes, with the least
-friction possible: for **evaluation, testing, demos and learning**. Build the
+Getting a working PGD, Failover Manager or logical-replication cluster in front
+of you in a few minutes, with the least friction possible: for **evaluation, testing, demos and learning**. Build the
 image once, press a cluster, break it, throw it away, press another. The whole
 point is that a cluster is cheap enough to treat as disposable.
 
@@ -59,7 +60,9 @@ going away.
 For anything real, use EDB's supported paths:
 [PGD CLI](https://www.enterprisedb.com/docs/pgd/latest/deploying/deploy-manual/),
 [PGD for Kubernetes](https://www.enterprisedb.com/docs/pgd/latest/deploying/deploy-kubernetes/),
-or [Hybrid Manager](https://www.enterprisedb.com/docs/pgd/latest/deploying/deploy-hm/).
+or [Hybrid Manager](https://www.enterprisedb.com/docs/pgd/latest/deploying/deploy-hm/),
+and for Failover Manager, its
+[installation guide](https://www.enterprisedb.com/docs/efm/latest/installing/).
 
 ## Could this do more than PGD?
 
@@ -116,8 +119,8 @@ of the reason this tool exists.
 | macOS | **26 or later** — on macOS 15 `container` cannot do container-to-container networking at all, which is the whole game |
 | Runtime | [`container`](https://github.com/apple/container/releases/latest) 1.3.0+, from the signed `.pkg` |
 | Rust | To build `cider` itself — [rustup](https://rustup.rs), edition 2024 (1.85+) |
-| Credentials | An EDB subscription token, for the build only — [get one here](https://www.enterprisedb.com/repos-downloads) |
-| RAM | ~6 GB free for three nodes at the 2 GB default |
+| Credentials | An EDB subscription token, to build the PGD and Failover Manager images (`cider logical` needs none) — [get one here](https://www.enterprisedb.com/repos-downloads) |
+| RAM | Each node is allowed 2 GB by default: ~6 GB for PGD or Failover Manager, 4 GB for logical. Far less is actually used; see [Notes and limits](#notes-and-limits) |
 
 `cider` is written in Rust, matching PGD 6's own `pgd` CLI. You don't have to
 think about that: `./cider` is a launcher that compiles the binary on first use
@@ -662,12 +665,27 @@ Then watch `./cider efm status` from the Mac. What happened, measured:
 
 A client writing through `:5450` every half second saw its writes fail for that
 minute, then carry on against `maeve-2` through the same address. Failover
-Manager's notifications go to each node's log (`./cider efm logs 2`), and its own
-view is one command away:
+Manager's notifications go to each node's log (`./cider efm logs 2`).
+
+### Failover Manager's own CLI
+
+`cider efm cli` runs Failover Manager's `efm` command inside a running node, as
+`cider pgd cli` runs the PGD CLI, and fills in the cluster name, so you type
+only the command:
 
 ```bash
-./cider efm cli cluster-status maeve
+./cider efm cli cluster-status
 ```
+
+```bash
+./cider efm cli replication-status
+```
+
+`replication-status`, new in 5.4, shows each standby's upstream, sync state and
+lag. Typing the cluster name yourself (`cluster-status maeve`) works too. A few
+commands act on the node they run on (`create-standby`, `node-status-json`,
+`resume`), and `cli` runs on the first running node. For another node, use
+`./cider efm shell 2` and run `efm` there.
 
 The automatic rejoin is Failover Manager's `auto.rewind` and `auto.basebackup`,
 which cider turns on. It tries `pg_rewind` first and falls back to
@@ -754,7 +772,7 @@ or `ui`: no leader to route to, no product CLI and no web UI.
 | `cider efm ui` / `web` | Open HAProxy's stats page: which node is primary |
 | `cider efm pour` | psql to the primary through the load balancer |
 | `cider efm psql [node] [args…]` | psql straight to a node (default 1) |
-| `cider efm cli <args…>` | Failover Manager's `efm` command, e.g. `cli cluster-status maeve` |
+| `cider efm cli <args…>` | Failover Manager's `efm` command, cluster name filled in, e.g. `cli cluster-status` |
 
 `containers`, `stop`, `start`, `down`, `pomace`, `shell` and `logs` work as they
 do for `pgd`, and include the load balancer. `[node]` takes `2`, `maeve-2`, or
@@ -969,14 +987,14 @@ The token is the credential for your EDB repositories, so this repo makes
 committing it hard:
 
 - **`.env` is gitignored**, and `.env.example` carries no value.
-- **The build takes it as a BuildKit secret** — `--secret id=edb_token,env=…`,
-  read from the environment of the `cider` process. Never a `--build-arg`, so it
-  never lands in the image config or layer history where `container image inspect`
-  would show it.
+- **The builds that need it take it as a BuildKit secret**: PGD's and Failover
+  Manager's, with `--secret id=edb_token,env=…`, read from the environment of the
+  `cider` process. Never a `--build-arg`, so it never lands in the image config
+  or layer history where `container image inspect` would show it.
 - **The apt repo files that embed the token are deleted in the same layer that
   creates them.** EDB's `setup.deb.sh` writes the token into
   `/etc/apt/sources.list.d/`, which would otherwise ship inside the image.
-- **The build audits itself**, failing if any credential-bearing
+- **Each build audits itself**, failing if any credential-bearing
   `downloads.enterprisedb.com` URL survives under `/etc`.
 
 None of this is strictly required for a throwaway local cluster, but a
@@ -1145,6 +1163,14 @@ To recover a node that will not start for this reason:
 access to that repository, or that pairing isn't published for Debian 12 arm64
 yet. `PG_MAJOR=17` is the known-good fallback the EDB quickstart ships.
 
+**An EFM node exits during `up`, or `status` says its agent is "not
+answering".** `./cider efm logs 1` shows the entrypoint's steps and Failover
+Manager's startup messages, including the reason an agent quit. The agent's full
+log is inside the node: `./cider efm shell 1`, then
+`less /var/log/efm-5.4/maeve.log`. `./cider efm cli cluster-status` gives
+Failover Manager's view of every agent. A node whose database has failed shows
+as *Idle* there, and as "not primary" in `status`.
+
 **`container` commands hang or error oddly.** `container system stop && container system start`
 fixes most of it; `container system logs` has the detail.
 
@@ -1197,10 +1223,13 @@ wiring SQL.
 ## Notes and limits
 
 - Apple `container` has no restart policy, so nodes don't come back after a
-  reboot. `cider pgd start` (or `cider logical start`) brings them back.
-- Each node is a lightweight VM, not a process — three at 2 GB is ~6 GB of RAM.
-  In practice they hold less: allocation is lazy, so three 2 GB nodes measured
-  about 2.9 GB resident rather than 6.
+  reboot. `cider pgd start` (or `logical start`, `efm start`) brings them back.
+- Each node is a lightweight VM, not a process, allowed 2 GB by default. In
+  practice they hold much less, because allocation is lazy. Measured with all
+  three products running: a PGD node about 350 MB, a Failover Manager node about
+  410 MB (its agent is Java), a logical node about 210 MB, and the load balancer
+  45 MB. That's under 3 GB for all nine containers, plus about 1.7 GB for the
+  runtime's build container while it's up.
 - **Nodes are stopped with SIGINT, not SIGTERM.** Postgres reads SIGTERM as a
   *smart* shutdown and waits for every client to disconnect — and PGD nodes
   hold connections open to each other, so that wait never ends. `container
