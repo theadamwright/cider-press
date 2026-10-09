@@ -56,6 +56,24 @@ log "node=${NODE_FQDN} pg=${PG_MAJOR} db=${POSTGRES_DB}"
 # also what makes `up`'s automatic retry of a failed node safe for this image.
 MARKER="${PGDATA}/.cider-press-provisioned"
 
+# A data directory belongs to one major version. Switching CIDER_LOGICAL_PG_MAJOR
+# on a pair that already exists leaves the old version's data on the volume,
+# which this server cannot open, and postgres would refuse to start with a
+# terse "database files are incompatible with server". Say what happened and
+# what to do instead.
+if [ -f "$MARKER" ] && [ -s "${PGDATA}/PG_VERSION" ]; then
+    data_major="$(cat "${PGDATA}/PG_VERSION")"
+    if [ "$data_major" != "$PG_MAJOR" ]; then
+        die "this node's volume holds PostgreSQL ${data_major} data, but this image is PostgreSQL ${PG_MAJOR}.
+
+     A data directory cannot change major version in place. To start over on
+     ${PG_MAJOR}, which deletes this pair's data:
+       cider logical pomace
+     then build and up again with CIDER_LOGICAL_PG_MAJOR=${PG_MAJOR}. Or go back
+     to CIDER_LOGICAL_PG_MAJOR=${data_major} to keep it."
+    fi
+fi
+
 if [ ! -f "$MARKER" ]; then
     if [ -n "$(ls -A "$PGDATA" 2>/dev/null)" ]; then
         log "discarding a partly initialised PGDATA from an earlier attempt"

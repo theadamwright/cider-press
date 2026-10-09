@@ -35,6 +35,14 @@ ENV LANG=en_US.UTF-8
 
 # PostgreSQL from PGDG, the PostgreSQL project's own repository.
 #
+# Released versions are in PGDG's `main` component. Betas and release
+# candidates of the next major are published in a component named after it
+# (`19`) until the release, so that component is added for whatever major is
+# asked for. Today that makes PG_MAJOR=19 install the newest 19 pre-release; a
+# rebuild picks up the next one, and after 19.0 ships it comes from `main`
+# (apt prefers it, since "19.0" sorts after "19~rc1"). For a released major,
+# the extra component is harmless.
+#
 # Debian's packaging creates and starts a cluster called "main" as part of the
 # install. The entrypoint makes its own on the volume instead, so that is
 # switched off first (postgresql-common owns the setting), and nothing is left
@@ -44,7 +52,7 @@ RUN set -eu; \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg; \
     . /etc/os-release; \
-    echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+    echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main ${PG_MAJOR}" \
       > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update -y; \
     apt-get install -y --no-install-recommends postgresql-common; \
@@ -55,10 +63,13 @@ RUN set -eu; \
     apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}"; \
     PG_BINDIR="/usr/lib/postgresql/${PG_MAJOR}/bin"; \
     test -x "${PG_BINDIR}/postgres" || { echo "no postgres in ${PG_BINDIR}" >&2; exit 1; }; \
+    PG_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' "postgresql-${PG_MAJOR}")"; \
+    echo "installed postgresql-${PG_MAJOR} ${PG_PACKAGE_VERSION} ($("${PG_BINDIR}/postgres" --version))"; \
     install -d /etc/cider-press; \
     { \
       echo "PG_FLAVOR=pgdg"; \
       echo "PG_MAJOR=${PG_MAJOR}"; \
+      echo "PG_PACKAGE_VERSION=${PG_PACKAGE_VERSION}"; \
       echo "PG_BINDIR=${PG_BINDIR}"; \
       echo "PG_SUPERUSER=postgres"; \
     } > /etc/cider-press/image.env; \

@@ -475,9 +475,11 @@ CIDER_POOL_MODE=transaction ./cider pgd up      # or set it in .env
 
 ## `cider logical`: core PostgreSQL logical replication
 
-Two community PostgreSQL 18 nodes, `dolores-1` and `dolores-2`, built from the
+Two community PostgreSQL nodes, `dolores-1` and `dolores-2`, built from the
 [PGDG](https://www.postgresql.org/download/linux/debian/) repository on Debian 13,
-both with `wal_level = logical`. cider creates the nodes; the replication between
+both with `wal_level = logical`: version 18 by default, or
+[any other](#choosing-a-postgresql-version), including the next release before
+it ships. cider creates the nodes; the replication between
 them is yours to create, which is the point: it's a quick way to see what core
 logical replication does, and what it leaves to you.
 
@@ -589,6 +591,61 @@ Now each node keeps its own row 4. Each node's log names the problem
 Nothing written afterwards reaches the other node until the conflict is resolved
 by hand. To start again from nothing, run
 `./cider logical pomace -y && ./cider logical build && ./cider logical up`.
+
+### Choosing a PostgreSQL version
+
+Both nodes run the same major version, 18 by default. Pick another with
+`CIDER_LOGICAL_PG_MAJOR`, which works for any version PGDG publishes for Debian
+13, **including the next release before it ships**:
+
+```bash
+CIDER_LOGICAL_PG_MAJOR=19 ./cider logical build
+```
+
+```bash
+CIDER_LOGICAL_PG_MAJOR=19 ./cider logical up
+```
+
+PGDG publishes betas and release candidates of the next major in a repository
+component of their own, named after it. The build adds that component for
+whatever major you ask for, so 19 installs the newest 19 pre-release (19beta4 as
+of this writing). Rebuild to pick up the next one, RC1 included, with no change
+to cider. Once 19.0 ships, the same command installs the release. `status` shows
+exactly what's running:
+
+```
+ dolores · logical replication · PostgreSQL 19beta4 · 2 nodes
+```
+
+Each major has its own image (`cider-press-logical:pg18`, `:pg19`), so building
+one doesn't replace the other. A data directory can't change major version,
+though, so to switch an existing pair, start it again from nothing (`pomace`,
+then `build` and `up` with the new version). Pointing an existing pair at
+another version stops with a message saying exactly that, rather than a
+Postgres startup failure.
+
+### PostgreSQL 19: sequence synchronisation
+
+PostgreSQL 19 can publish sequences (`CREATE PUBLICATION ... FOR ALL
+SEQUENCES`). On 19, `./cider logical endpoints` prints a second script for it,
+one way from `dolores-1` to `dolores-2`: the case of moving to the subscriber in
+an upgrade or a switchover. What it shows, measured on 19beta4:
+
+1. `CREATE SUBSCRIPTION` copies each sequence's value once, along with the rows.
+2. After that, **rows keep replicating but sequences don't.** With 20 orders on
+   both nodes, the subscriber's sequence still stood at 5, so the first insert
+   there failed with `duplicate key ... Key (id)=(6) already exists`.
+3. `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` brings the values level, and the
+   next insert on the subscriber gets id 21.
+
+Two things the script is careful about:
+
+- **`REFRESH SEQUENCES` returns before the value changes.** A background worker
+  applies it, measured at under half a second, but an `INSERT` sent in the same
+  breath still got the old value. The script checks `last_value` in between.
+- **Stop writing on the publisher first.** Sequences are synchronised one way,
+  at that moment. Writing on both nodes afterwards gives both the same next id,
+  and the publisher's row then conflicts on the subscriber (`insert_exists`).
 
 ## `cider efm`: EDB Failover Manager
 
@@ -924,7 +981,8 @@ both can run at once:
 | `dolores-1` | `cider-press-dolores-1` | **5442** |
 | `dolores-2` | `cider-press-dolores-2` | 5443 |
 
-Its image is `cider-press-logical:latest`, and its database is `demo`.
+Its image is `cider-press-logical:pg18` (one per major version), and its
+database is `demo`.
 
 `cider efm up` creates four more:
 
@@ -989,7 +1047,7 @@ be confused with PGD's. The shared ones above (`CIDER_DOMAIN`, `CIDER_PASSWORD`,
 
 | Variable | Default | |
 |---|---|---|
-| `CIDER_LOGICAL_PG_MAJOR` | `18` | 16 or later, for `origin = none` |
+| `CIDER_LOGICAL_PG_MAJOR` | `18` | 16 or later, for `origin = none`. The next major's newest beta or release candidate if it isn't released yet: 19 gives 19beta4 today |
 | `CIDER_LOGICAL_DEBIAN_VERSION` | `13` | Separate from PGD's `DEBIAN_VERSION` (12): PGDG supports new Debian releases months before EDB does |
 | `CIDER_LOGICAL_DB` | `demo` | The database both nodes create |
 | `CIDER_LOGICAL_PG_PORT_BASE` | `5442` | `dolores-1` gets this, `dolores-2` the next |

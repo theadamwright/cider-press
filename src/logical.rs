@@ -261,54 +261,90 @@ fn fetch_state(cfg: &Config, name: &str) -> Option<NodeState> {
 /// answering yet, is shown as such alongside the others.
 pub fn status(cfg: &Config) -> Result<()> {
     let d = deployment(cfg);
-    println!(
-        " {} · {} · PostgreSQL {} · {} nodes",
-        term::bold_amber(d.cluster_name),
-        d.title,
-        cfg.logical.pg_major,
-        d.nodes
-    );
-    println!();
-    println!(
-        "  {:<14}{:<10}{:<16}SUBSCRIPTIONS",
-        "NODE", "WAL", "PUBLICATIONS"
-    );
 
+    // Gather first, print after: the publications column is sized to its
+    // widest entry, so two publications cannot run into the next column.
+    enum Row {
+        Up {
+            wal: String,
+            pubs: String,
+            subs: String,
+        },
+        Down(&'static str),
+    }
+    let mut rows = Vec::new();
     let mut any_subscription = false;
     let mut waiting_for_dns = Vec::new();
     for i in 1..=d.nodes {
         let name = d.host_name(i);
         let running = container::state(&name) == container::State::Running;
-        match running.then(|| fetch_state(cfg, &name)).flatten() {
+        let row = match running.then(|| fetch_state(cfg, &name)).flatten() {
             Some(s) => {
                 any_subscription |= !s.subscriptions.is_empty();
-                let pubs = if s.publications.is_empty() {
-                    "—".to_string()
-                } else {
-                    s.publications.join(",")
-                };
-                let subs = if s.subscriptions.is_empty() {
-                    "—".to_string()
-                } else {
-                    s.subscriptions
-                        .iter()
-                        .map(describe_subscription)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                };
-                println!("  {name:<14}{:<10}{pubs:<16}{subs}", s.wal_level);
                 if container::resolves_inside(&name, &d.host_fqdn(i)) == Some(false) {
                     waiting_for_dns.push(d.host_fqdn(i));
                 }
+                Row::Up {
+                    wal: s.wal_level,
+                    pubs: if s.publications.is_empty() {
+                        "—".into()
+                    } else {
+                        s.publications.join(",")
+                    },
+                    subs: if s.subscriptions.is_empty() {
+                        "—".into()
+                    } else {
+                        s.subscriptions
+                            .iter()
+                            .map(describe_subscription)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    },
+                }
             }
-            None => {
-                let why = match container::state(&name) {
-                    container::State::Running => "running, not answering yet",
-                    container::State::Stopped => "stopped",
-                    container::State::Absent => "not created",
-                };
-                println!("  {name:<14}{}", term::dim(why));
+            None => Row::Down(match container::state(&name) {
+                container::State::Running => "running, not answering yet",
+                container::State::Stopped => "stopped",
+                container::State::Absent => "not created",
+            }),
+        };
+        rows.push((name, row));
+    }
+    let pubs_width = rows
+        .iter()
+        .filter_map(|(_, r)| match r {
+            Row::Up { pubs, .. } => Some(pubs.chars().count()),
+            Row::Down(_) => None,
+        })
+        .chain(["PUBLICATIONS".len()])
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    // The version as the server reports it -- "19beta4", "18.6" -- so it is
+    // plain which pre-release a demo is running on. The configured major if
+    // no node answers.
+    let version = (1..=d.nodes)
+        .find_map(|i| server_version(cfg, &d.host_name(i)))
+        .unwrap_or_else(|| cfg.logical.pg_major.clone());
+    println!(
+        " {} · {} · PostgreSQL {} · {} nodes",
+        term::bold_amber(d.cluster_name),
+        d.title,
+        version,
+        d.nodes
+    );
+    println!();
+    println!(
+        "  {:<14}{:<10}{:<pubs_width$}SUBSCRIPTIONS",
+        "NODE", "WAL", "PUBLICATIONS"
+    );
+    for (name, row) in rows {
+        match row {
+            Row::Up { wal, pubs, subs } => {
+                println!("  {name:<14}{wal:<10}{pubs:<pubs_width$}{subs}")
             }
+            Row::Down(why) => println!("  {name:<14}{}", term::dim(why)),
         }
     }
 
@@ -324,6 +360,31 @@ pub fn status(cfg: &Config) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The server's own version string, e.g. "19beta4" or "18.6".
+fn server_version(cfg: &Config, name: &str) -> Option<String> {
+    if container::state(name) != container::State::Running {
+        return None;
+    }
+    container::exec_capture(
+        name,
+        &[("PGPASSWORD", cfg.password.as_str())],
+        &[
+            "psql",
+            "-X",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            &cfg.logical.user,
+            "-d",
+            &cfg.logical.db,
+            "-tAqc",
+            "show server_version",
+        ],
+    )
+    .map(|v| v.split_whitespace().next().unwrap_or("").to_string())
+    .filter(|v| !v.is_empty())
 }
 
 /// "from_dolores_2 streaming", with the apply error count when there is one.
@@ -361,14 +422,80 @@ pub fn endpoints(cfg: &Config) {
     }
     println!();
     term::info("wire up replication in both directions");
-    for line in wiring_sql(&d, &cfg.logical.db).lines() {
-        // No indent on blank lines: trailing spaces paste badly.
+    print_sql(&wiring_sql(&d, &cfg.logical.db));
+
+    if major_at_least(&cfg.logical.pg_major, 19) {
+        println!();
+        term::info("PostgreSQL 19: sequences, one way, dolores-1 to dolores-2");
+        print_sql(&sequence_sql(&d, &cfg.logical.db));
+    }
+}
+
+/// Print SQL indented for the terminal. No indent on blank lines: trailing
+/// spaces paste badly.
+fn print_sql(sql: &str) {
+    for line in sql.lines() {
         if line.is_empty() {
             println!();
         } else {
             println!("  {line}");
         }
     }
+}
+
+/// Whether a major version string ("18", "19") is at least `at_least`.
+fn major_at_least(major: &str, at_least: u32) -> bool {
+    major.parse::<u32>().is_ok_and(|m| m >= at_least)
+}
+
+/// PostgreSQL 19's sequence synchronisation, as a script to follow.
+///
+/// What it shows, measured on 19beta4: CREATE SUBSCRIPTION copies a sequence's
+/// value once, along with the rows. After that, rows keep replicating but the
+/// sequence does not -- the subscriber's stays where it was -- until ALTER
+/// SUBSCRIPTION ... REFRESH SEQUENCES brings it level. Skip that before
+/// writing on the subscriber, as in a switchover, and its first insert takes
+/// an id that has already been replicated: a duplicate-key error.
+///
+/// One way, and the order matters: stop writing on the publisher before
+/// refreshing. Writing on both afterwards gives both the same next id, and the
+/// publisher's then conflicts on the subscriber.
+///
+/// REFRESH SEQUENCES returns before the value changes: a background worker
+/// applies it, measured at under half a second. An INSERT sent in the same
+/// breath still got the old value and collided, so the script checks
+/// last_value in between.
+fn sequence_sql(d: &Deployment, db: &str) -> String {
+    let sub = format!("orders_{}", subscription_name(d, 1));
+    format!(
+        "-- on BOTH nodes\n\
+         CREATE SEQUENCE order_id;\n\
+         CREATE TABLE orders (id bigint PRIMARY KEY DEFAULT nextval('order_id'), item text);\n\
+         \n\
+         -- on {p} (./cider logical psql 1): publish the table, and every sequence\n\
+         CREATE PUBLICATION pub_orders FOR TABLE orders;\n\
+         CREATE PUBLICATION pub_sequences FOR ALL SEQUENCES;\n\
+         INSERT INTO orders (item) SELECT 'order ' || g FROM generate_series(1, 5) g;\n\
+         \n\
+         -- on {s} (./cider logical psql 2): rows and the sequence's value both arrive\n\
+         CREATE SUBSCRIPTION {sub}\n  \
+         CONNECTION 'host={pf} dbname={db} tcp_user_timeout=5000'\n  \
+         PUBLICATION pub_orders, pub_sequences;\n\
+         \n\
+         -- on {p}: more orders. The rows replicate; the sequence does not\n\
+         INSERT INTO orders (item) SELECT 'order ' || g FROM generate_series(6, 20) g;\n\
+         \n\
+         -- on {s}: last_value is still 5, so a write here would take id 6: duplicate key\n\
+         SELECT last_value FROM order_id;\n\
+         \n\
+         -- switch over: stop writing on {p}, then on {s}\n\
+         ALTER SUBSCRIPTION {sub} REFRESH SEQUENCES;\n\
+         SELECT last_value FROM order_id;  -- 20, once a background worker applies it: under a second\n\
+         INSERT INTO orders (item) VALUES ('first order on {s}') RETURNING id;  -- 21\n",
+        p = d.host_name(1),
+        s = d.host_name(2),
+        pf = d.host_fqdn(1),
+    )
 }
 
 /// A subscription name for "from node `i`": `from_dolores_2`. Hyphens are not
@@ -468,6 +595,28 @@ mod tests {
              CONNECTION 'host=dolores-1.cider dbname=demo tcp_user_timeout=5000'"
         ));
         assert_eq!(sql.matches("origin = none, copy_data = false").count(), 2);
+    }
+
+    #[test]
+    fn sequence_demo_appears_from_19() {
+        assert!(!major_at_least("18", 19));
+        assert!(major_at_least("19", 19));
+        assert!(major_at_least("20", 19));
+        assert!(!major_at_least("nineteen", 19));
+        let sql = sequence_sql(&pair(), "demo");
+        assert!(sql.contains("CREATE PUBLICATION pub_sequences FOR ALL SEQUENCES;"));
+        assert!(sql.contains(
+            "CREATE SUBSCRIPTION orders_from_dolores_1\n  \
+             CONNECTION 'host=dolores-1.cider dbname=demo tcp_user_timeout=5000'\n  \
+             PUBLICATION pub_orders, pub_sequences;"
+        ));
+        // The refresh comes after "stop writing", and the first write on the
+        // subscriber only after checking the refresh has landed.
+        let stop = sql.find("stop writing on dolores-1").unwrap();
+        let refresh = sql.find("REFRESH SEQUENCES").unwrap();
+        let check = sql.rfind("SELECT last_value").unwrap();
+        let write = sql.find("first order on dolores-2").unwrap();
+        assert!(stop < refresh && refresh < check && check < write);
     }
 
     #[test]

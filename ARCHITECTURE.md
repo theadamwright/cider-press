@@ -153,7 +153,7 @@ start `cider-press-`.
 Two products must not share these, or they can't run at the same time: the
 container names, the volume names, the image tag and the loopback ports. PGD
 uses `host-1..3`, image `cider-press:latest`, and ports 5432-5434 and 6432-6457.
-`cider logical` uses `dolores-1..2`, image `cider-press-logical:latest`, and
+`cider logical` uses `dolores-1..2`, image `cider-press-logical:pg<major>`, and
 ports 5442-5443. Volume names include the container name, so a shared volume
 prefix is fine.
 
@@ -397,7 +397,17 @@ but no cluster has been stood up on either. Treat them as plausible, not proven.
 `cider logical` on its defaults (PostgreSQL 18, Debian 13) has been built and
 run end to end: the printed wiring SQL pasted as-is, replication in both
 directions, no echo loop, and a forced `insert_exists` conflict showing in
-`status`. Other `CIDER_LOGICAL_PG_MAJOR` values have not been tried.
+`status`. PostgreSQL 19beta4 (`CIDER_LOGICAL_PG_MAJOR=19`) has been built and
+run end to end too: the printed sequence-synchronisation script followed as
+printed, and a pair whose data is 19 refusing an 18 image with the version
+message. 18 was rebuilt with the pre-release component added and still
+installs 18.6. Versions below 18 have not been tried.
+
+Pre-releases come from PGDG's per-major component (`trixie-pgdg 19`), which
+the logical Dockerfile adds for whatever major is asked for. That's how 19
+installs before 19.0 ships, and why a rebuild is all it takes to move from one
+pre-release to the next. apt prefers the released version once it exists
+(`19.0` sorts after `19~rc1`), so nothing needs undoing at release.
 
 `cider efm` on its defaults (EFM 5.4, PGE 18, Debian 12) has been built and run
 end to end: writes through the load balancer from macOS reaching both standbys,

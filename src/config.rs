@@ -297,15 +297,21 @@ impl LogicalConfig {
     /// `cider logical`'s settings, all under `CIDER_LOGICAL_*` so none can be
     /// confused with PGD's. Only called from [`Config::load`].
     fn from_env() -> Self {
+        let pg_major = var("CIDER_LOGICAL_PG_MAJOR", "18");
         LogicalConfig {
             nodes: 2,
             host_prefix: var("CIDER_LOGICAL_HOST_PREFIX", "dolores-"),
             volume_prefix: var("CIDER_LOGICAL_VOLUME_PREFIX", "cider-press-"),
-            image: var("CIDER_LOGICAL_IMAGE", "cider-press-logical:latest"),
+            // One image per major, so switching between 18 and 19 for a demo
+            // is a pomace and an up, not a rebuild each way.
+            image: var(
+                "CIDER_LOGICAL_IMAGE",
+                &format!("cider-press-logical:pg{pg_major}"),
+            ),
             cluster_name: "dolores".into(),
             db: var("CIDER_LOGICAL_DB", "demo"),
             user: "postgres".into(),
-            pg_major: var("CIDER_LOGICAL_PG_MAJOR", "18"),
+            pg_major,
             debian_version: var("CIDER_LOGICAL_DEBIAN_VERSION", "13"),
             pg_port_base: var_parse("CIDER_LOGICAL_PG_PORT_BASE", 5442u16),
         }
