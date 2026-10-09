@@ -837,7 +837,7 @@ and one runtime.
 | `cider logical build [--no-cache]` | Build the node image. No token needed |
 | `cider logical up` / `press` | Create both nodes, then print the SQL to wire them up |
 | `cider logical status` / `ps` | Each node's publications, subscriptions and apply errors |
-| `cider logical endpoints` | How to connect, and the wiring SQL again |
+| `cider logical endpoints` | How to connect, and the wiring SQL again. On 19 and later, the sequence-synchronisation script too |
 | `cider logical psql [node] [args…]` | psql to a node (default 1) |
 
 `containers`, `stop`, `start`, `down`, `pomace`, `shell` and `logs` work exactly
@@ -1286,7 +1286,7 @@ cider-press/
 ├── image/
 │   ├── Dockerfile        # Debian 12 + PGE 18 + PGD 6.5, token as a secret
 │   ├── entrypoint.sh     # per-node provisioning, join, monitor enablement
-│   ├── logical.Dockerfile      # Debian 13 + PGDG PostgreSQL 18, no token
+│   ├── logical.Dockerfile      # Debian 13 + PGDG PostgreSQL, any major incl. pre-releases, no token
 │   ├── logical-entrypoint.sh   # initdb, wal_level = logical, the demo database
 │   ├── efm.Dockerfile          # Debian 12 + PGE 18 + EFM 5.4 + HAProxy, token as a secret
 │   ├── efm-entrypoint.sh       # provision, configure EFM, supervise postgres and the agent
