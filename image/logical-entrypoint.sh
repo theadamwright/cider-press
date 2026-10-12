@@ -120,5 +120,36 @@ else
     log "existing PGDATA found, skipping provisioning"
 fi
 
+# --- Conflict detail, every start ------------------------------------------------
+# track_commit_timestamp records which origin last wrote each row, and when.
+# The apply worker uses it to notice that an incoming change overwrites a row
+# another origin changed: update_origin_differs and delete_origin_differs are
+# only *detected* with it on (the change is applied either way), and every
+# conflict's log line gains the conflicting row's origin and commit time. Off
+# is Postgres's default; on is this lab's, because seeing conflicts is the
+# point. LOGICAL_TRACK_COMMIT_TIMESTAMP=off leaves Postgres's default.
+#
+# Ensured on every start, so a pair made before this existed gets it, and
+# checked with `postgres -C` like EFM's synchronous setting, so a line that
+# does not parse costs the detail, not the node. Takes effect at this start,
+# since the server is started below.
+tct_line="track_commit_timestamp = on  # cider-press"
+pg_conf="${PGDATA}/postgresql.conf"
+if [ "${LOGICAL_TRACK_COMMIT_TIMESTAMP:-on}" = "on" ]; then
+    if ! grep -qxF "$tct_line" "$pg_conf"; then
+        sed -i '/^track_commit_timestamp = .*# cider-press$/d' "$pg_conf"
+        printf '%s\n' "$tct_line" >> "$pg_conf"
+        if postgres -D "$PGDATA" -C track_commit_timestamp >/dev/null 2>&1; then
+            log "track_commit_timestamp on: conflicts are detected and logged in full"
+        else
+            sed -i '/^track_commit_timestamp = .*# cider-press$/d' "$pg_conf"
+            log "track_commit_timestamp did not parse; removed it"
+        fi
+    fi
+elif grep -q '^track_commit_timestamp = .*# cider-press$' "$pg_conf"; then
+    sed -i '/^track_commit_timestamp = .*# cider-press$/d' "$pg_conf"
+    log "track_commit_timestamp left at Postgres's default (off)"
+fi
+
 log "starting postgres"
 exec postgres -D "$PGDATA"

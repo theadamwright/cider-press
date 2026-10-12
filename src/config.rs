@@ -116,6 +116,10 @@ pub struct LogicalConfig {
     /// Host port for node 1's Postgres; node 2 gets the next one. Clear of
     /// PGD's 5432-5434.
     pub pg_port_base: u16,
+    /// Record each row's origin and commit time, so the apply worker can
+    /// detect and fully report conflicts. On by default here; Postgres's own
+    /// default is off.
+    pub track_commit_timestamp: bool,
 }
 
 /// An environment variable, or `default` if unset or empty.
@@ -314,6 +318,7 @@ impl LogicalConfig {
             pg_major,
             debian_version: var("CIDER_LOGICAL_DEBIAN_VERSION", "13"),
             pg_port_base: var_parse("CIDER_LOGICAL_PG_PORT_BASE", 5442u16),
+            track_commit_timestamp: var_on("CIDER_LOGICAL_TRACK_COMMIT_TIMESTAMP"),
         }
     }
 

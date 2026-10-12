@@ -111,6 +111,15 @@ fn start_node(cfg: &Config, i: u16) -> Result<()> {
         "--env".into(),
         format!("POSTGRES_DB={}", cfg.logical.db),
         "--env".into(),
+        format!(
+            "LOGICAL_TRACK_COMMIT_TIMESTAMP={}",
+            if cfg.logical.track_commit_timestamp {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        "--env".into(),
         format!("POSTGRES_USER={}", cfg.logical.user),
         "--env".into(),
         format!("PGPASSWORD={}", cfg.password),
@@ -167,11 +176,21 @@ struct Subscription {
     /// streaming | stopped | disabled
     state: String,
     apply_errors: u64,
+    /// Conflicts by type, non-zero ones only: `[("update_origin_differs", 1)]`.
+    /// These include the ones Postgres handles by itself, which never show as
+    /// apply errors.
+    conflicts: Vec<(String, u64)>,
 }
 
 /// One row, `|`-separated: wal_level | publications | subscriptions, where
-/// each subscription is `name:state:apply_errors` and lists are
-/// comma-separated. Public catalogs and statistics views only.
+/// each subscription is `name:state:apply_errors:conflicts`, conflicts are
+/// `type=count` joined by `+`, and lists are comma-separated. Public catalogs
+/// and statistics views only.
+///
+/// The per-type conflict counters (`confl_insert_exists` and so on) arrived
+/// in PostgreSQL 18, and more were added in 19. They are read through
+/// `to_jsonb` rather than by name, so whatever this server has is shown and a
+/// version without them simply shows none.
 ///
 /// "streaming" means the subscription's leader apply worker is running. A
 /// subscription whose apply worker keeps failing — a conflict it cannot
@@ -190,7 +209,10 @@ select current_setting('wal_level'),
                                        and st.relid is null and st.leader_pid is null)
                         then 'streaming'
                         else 'stopped' end || ':' ||
-                   coalesce(ss.apply_error_count, 0),
+                   coalesce(ss.apply_error_count, 0) || ':' ||
+                   coalesce((select string_agg(substr(c.key, 7) || '=' || c.value, '+' order by c.key)
+                             from jsonb_each_text(to_jsonb(ss)) c
+                             where c.key like 'confl\\_%' and c.value::bigint > 0), ''),
                    ',' order by s.subname)
                  from pg_subscription s
                  left join pg_stat_subscription_stats ss on ss.subid = s.oid
@@ -214,7 +236,16 @@ fn parse_state(row: &str) -> Option<NodeState> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             // Split from the right, so a name containing ':' still parses.
-            let mut parts = s.rsplitn(3, ':');
+            let mut parts = s.rsplitn(4, ':');
+            let conflicts = parts
+                .next()?
+                .split('+')
+                .filter(|c| !c.is_empty())
+                .map(|c| {
+                    let (kind, n) = c.split_once('=')?;
+                    Some((kind.to_string(), n.parse().ok()?))
+                })
+                .collect::<Option<Vec<_>>>()?;
             let apply_errors = parts.next()?.parse().ok()?;
             let state = parts.next()?.to_string();
             let name = parts.next()?.to_string();
@@ -222,6 +253,7 @@ fn parse_state(row: &str) -> Option<NodeState> {
                 name,
                 state,
                 apply_errors,
+                conflicts,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -389,11 +421,22 @@ fn server_version(cfg: &Config, name: &str) -> Option<String> {
 
 /// "from_dolores_2 streaming", with the apply error count when there is one.
 fn describe_subscription(s: &Subscription) -> String {
-    match s.apply_errors {
+    let mut out = match s.apply_errors {
         0 => format!("{} {}", s.name, s.state),
         1 => format!("{} {}, 1 apply error", s.name, s.state),
         n => format!("{} {}, {n} apply errors", s.name, s.state),
+    };
+    // Every conflict, by type. An automatically handled one, such as
+    // update_origin_differs, appears only here: replication carried on.
+    if !s.conflicts.is_empty() {
+        let list: Vec<String> = s
+            .conflicts
+            .iter()
+            .map(|(kind, n)| format!("{kind} {n}"))
+            .collect();
+        out.push_str(&format!(" · conflicts: {}", list.join(", ")));
     }
+    out
 }
 
 // --- endpoints -------------------------------------------------------------
@@ -640,7 +683,10 @@ mod tests {
 
     #[test]
     fn parses_publications_and_subscriptions() {
-        let s = parse_state("logical|pp,qq|from_dolores_2:streaming:0,other:stopped:3").unwrap();
+        let s = parse_state(
+            "logical|pp,qq|from_dolores_2:streaming:0:,other:stopped:3:insert_exists=3",
+        )
+        .unwrap();
         assert_eq!(s.publications, ["pp", "qq"]);
         assert_eq!(s.subscriptions.len(), 2);
         assert_eq!(
@@ -649,6 +695,7 @@ mod tests {
                 name: "other".into(),
                 state: "stopped".into(),
                 apply_errors: 3,
+                conflicts: vec![("insert_exists".into(), 3)],
             }
         );
         assert_eq!(
@@ -657,7 +704,21 @@ mod tests {
         );
         assert_eq!(
             describe_subscription(&s.subscriptions[1]),
-            "other stopped, 3 apply errors"
+            "other stopped, 3 apply errors · conflicts: insert_exists 3"
+        );
+    }
+
+    // A conflict Postgres handled by itself: no apply errors, still streaming,
+    // but it is counted, and status says so.
+    #[test]
+    fn shows_automatically_handled_conflicts() {
+        let s = parse_state(
+            "logical|pp|from_dolores_2:streaming:0:update_origin_differs=1+update_missing=2",
+        )
+        .unwrap();
+        assert_eq!(
+            describe_subscription(&s.subscriptions[0]),
+            "from_dolores_2 streaming · conflicts: update_origin_differs 1, update_missing 2"
         );
     }
 
@@ -665,6 +726,10 @@ mod tests {
     fn rejects_rows_of_the_wrong_shape() {
         assert_eq!(parse_state(""), None);
         assert_eq!(parse_state("logical|pp"), None);
-        assert_eq!(parse_state("logical||sub:streaming:notanumber"), None);
+        assert_eq!(parse_state("logical||sub:streaming:notanumber:"), None);
+        assert_eq!(
+            parse_state("logical||sub:streaming:0:insert_exists=x"),
+            None
+        );
     }
 }

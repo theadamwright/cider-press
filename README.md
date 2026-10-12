@@ -554,10 +554,43 @@ Why the SQL looks the way it does:
 
 ### Seeing a conflict
 
-Core logical replication detects and logs conflicts, but doesn't resolve them.
-Two inserts typed quickly usually won't collide: the first replicates before the
-second is typed. To make one happen, pause both subscriptions, insert the same
-key on each node, then resume them.
+Core logical replication detects conflicts, but it has no conflict resolution
+policies to choose from. What happens is fixed, by type, and comes in two kinds:
+
+- **Some stop replication until someone resolves them by hand.** These are the
+  ones that would break a constraint, such as inserting a key that already
+  exists. The apply worker errors and retries, and nothing behind it in the
+  stream gets through.
+- **The rest are handled automatically,** by a fixed rule: the incoming change
+  is applied, or skipped if its row is missing. Replication carries on, but
+  nothing reconciles the two sides afterwards, so **the tables can end up
+  different**, and only the log and the counters say so.
+
+| Conflict | What Postgres does | Replication |
+|---|---|---|
+| `insert_exists`, `update_exists`, `multiple_unique_conflicts` | errors until resolved by hand | **stops** |
+| `update_origin_differs`, `delete_origin_differs` | applies the incoming change: the remote side wins | carries on |
+| `update_missing`, `delete_missing`, `update_deleted` | skips the change | carries on |
+
+That's from PostgreSQL 19's
+[documentation](https://www.postgresql.org/docs/19/logical-replication-conflicts.html),
+and the apply worker's source agrees: an `update_origin_differs` is reported at
+`LOG` level, then the incoming row is applied unconditionally.
+
+**cider turns on `track_commit_timestamp`,** which Postgres leaves off by
+default. Without it, `update_origin_differs`, `delete_origin_differs` and
+`update_deleted` aren't even *detected*. The change still happens, silently.
+With it on, every conflict's log line also gives the conflicting row's origin
+and commit time. Set `CIDER_LOGICAL_TRACK_COMMIT_TIMESTAMP=off` to see stock
+behaviour.
+
+Two quick inserts or updates typed on each node won't usually collide: the first
+replicates before the second is typed. Both recipes below pause the
+subscriptions first, so the two changes meet.
+
+#### A conflict that stops replication
+
+Insert the same key on both nodes.
 
 On `dolores-1`:
 
@@ -580,16 +613,90 @@ Back on `dolores-1`:
 ALTER SUBSCRIPTION from_dolores_2 ENABLE;
 ```
 
-Now each node keeps its own row 4. Each node's log names the problem
-(`conflict detected on relation "public.pingpong": conflict=insert_exists`), and
-`status` shows the apply worker retrying:
+Each node keeps its own row 4, and the apply worker on each retries for ever:
 
 ```
-  dolores-1     logical   pp              from_dolores_2 stopped, 4 apply errors
+  dolores-1     logical   pp   from_dolores_2 stopped, 4 apply errors · conflicts: insert_exists 4
 ```
 
-Nothing written afterwards reaches the other node until the conflict is resolved
-by hand. To start again from nothing, run
+The log says exactly what collided (`./cider logical logs 1 | grep -A3 "conflict detected"`):
+
+```
+ERROR:  conflict detected on relation "public.pingpong": conflict=insert_exists
+DETAIL:  Could not apply remote change: remote row (4, from dolores-2).
+         Key already exists in unique index "pingpong_pkey", ...: key (id)=(4), local row (4, from dolores-1).
+CONTEXT: ... in transaction 697, finished at 0/01C0E870
+```
+
+Nothing written afterwards reaches the other node until it's resolved. Either
+change the data so the retry succeeds (delete the local row 4, say), or skip the
+remote transaction using the LSN from the `CONTEXT` line:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 SKIP (lsn = '0/01C0E870');
+```
+
+Skipping drops that *whole* remote transaction, including any changes in it that
+didn't conflict, and that's where nodes quietly start to differ. The subscription
+option `disable_on_error` stops the retry loop by disabling the subscription at
+the first error.
+
+#### A conflict handled automatically, and the tables that differ after it
+
+Update the same row on both nodes. Start with a row both have, inserted on
+`dolores-1` and replicated to `dolores-2`:
+
+```sql
+INSERT INTO pingpong VALUES (100, 'original');
+```
+
+On `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 DISABLE;
+UPDATE pingpong SET msg = 'changed on dolores-1' WHERE id = 100;
+```
+
+On `dolores-2`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_1 DISABLE;
+UPDATE pingpong SET msg = 'changed on dolores-2' WHERE id = 100;
+ALTER SUBSCRIPTION from_dolores_1 ENABLE;
+```
+
+Back on `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 ENABLE;
+```
+
+Each node applies the *other's* update, so the two values swap:
+
+```sql
+SELECT msg FROM pingpong WHERE id = 100;
+-- dolores-1: changed on dolores-2
+-- dolores-2: changed on dolores-1
+```
+
+No error, nothing retrying, and new writes keep replicating. The only signs are
+a `LOG` line on each node and a counter in `status`:
+
+```
+  dolores-1     logical   pp   from_dolores_2 streaming · conflicts: update_origin_differs 1
+```
+
+```
+LOG:     conflict detected on relation "public.pingpong": conflict=update_origin_differs
+DETAIL:  Updating the row that was modified locally in transaction 683 at 2026-10-12 14:29:49.01386+00:
+         local row (100, changed on dolores-1), remote row (100, changed on dolores-2), replica identity (id)=(100).
+```
+
+The tables stay different until someone notices and puts them right. Turn
+`track_commit_timestamp` off and the same swap happens with no log line and no
+counter at all.
+
+To start again from nothing, run
 `./cider logical pomace -y && ./cider logical build && ./cider logical up`.
 
 ### Choosing a PostgreSQL version
@@ -1051,6 +1158,7 @@ be confused with PGD's. The shared ones above (`CIDER_DOMAIN`, `CIDER_PASSWORD`,
 | `CIDER_LOGICAL_DEBIAN_VERSION` | `13` | Separate from PGD's `DEBIAN_VERSION` (12): PGDG supports new Debian releases months before EDB does |
 | `CIDER_LOGICAL_DB` | `demo` | The database both nodes create |
 | `CIDER_LOGICAL_PG_PORT_BASE` | `5442` | `dolores-1` gets this, `dolores-2` the next |
+| `CIDER_LOGICAL_TRACK_COMMIT_TIMESTAMP` | `on` | Record each row's origin and commit time, so conflicts are detected and logged in full. `off` is Postgres's default |
 
 `cider efm`'s settings are prefixed `CIDER_EFM_`, and the same shared ones apply.
 

@@ -403,6 +403,15 @@ printed, and a pair whose data is 19 refusing an 18 image with the version
 message. 18 was rebuilt with the pre-release component added and still
 installs 18.6. Versions below 18 have not been tried.
 
+Both conflict recipes in the README were run on 19beta4 with
+`track_commit_timestamp` on: `insert_exists` stopping replication, and
+`update_origin_differs` swapping the two nodes' values while replication
+carried on. That the incoming change is applied regardless was also checked
+in the apply worker's source (`apply_handle_update_internal` reports the
+conflict at `LOG` level and then updates), and that detection needs commit
+timestamps in `GetTupleTransactionInfo`, which returns early when
+`track_commit_timestamp` is off.
+
 Pre-releases come from PGDG's per-major component (`trixie-pgdg 19`), which
 the logical Dockerfile adds for whatever major is asked for. That's how 19
 installs before 19.0 ships, and why a rebuild is all it takes to move from one
