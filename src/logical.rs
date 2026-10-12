@@ -469,7 +469,11 @@ pub fn endpoints(cfg: &Config) {
 
     if major_at_least(&cfg.logical.pg_major, 19) {
         println!();
-        term::info("PostgreSQL 19: sequences, one way, dolores-1 to dolores-2");
+        term::info(&format!(
+            "PostgreSQL 19: sequences, one way, {} to {}",
+            d.host_name(1),
+            d.host_name(2)
+        ));
         print_sql(&sequence_sql(&d, &cfg.logical.db));
     }
 }

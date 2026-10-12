@@ -570,7 +570,7 @@ policies to choose from. What happens is fixed, by type, and comes in two kinds:
 |---|---|---|
 | `insert_exists`, `update_exists`, `multiple_unique_conflicts` | errors until resolved by hand | **stops** |
 | `update_origin_differs`, `delete_origin_differs` | applies the incoming change: the remote side wins | carries on |
-| `update_missing`, `delete_missing`, `update_deleted` | skips the change | carries on |
+| `update_missing`, `delete_missing`, `update_deleted` ([19](#postgresql-19-a-row-deleted-on-one-node-and-updated-on-the-other)) | skips the change | carries on |
 
 That's from PostgreSQL 19's
 [documentation](https://www.postgresql.org/docs/19/logical-replication-conflicts.html),
@@ -585,7 +585,7 @@ and commit time. Set `CIDER_LOGICAL_TRACK_COMMIT_TIMESTAMP=off` to see stock
 behaviour.
 
 Two quick inserts or updates typed on each node won't usually collide: the first
-replicates before the second is typed. Both recipes below pause the
+replicates before the second is typed. The recipes below pause the
 subscriptions first, so the two changes meet.
 
 #### A conflict that stops replication
@@ -695,6 +695,111 @@ DETAIL:  Updating the row that was modified locally in transaction 683 at 2026-1
 The tables stay different until someone notices and puts them right. Turn
 `track_commit_timestamp` off and the same swap happens with no log line and no
 counter at all.
+
+#### PostgreSQL 19: a row deleted on one node and updated on the other
+
+Say `dolores-1` deletes a row while `dolores-2` updates it. When the update
+reaches `dolores-1`, the row is gone. By default, that's reported as
+`update_missing`, exactly like an update to a row that never existed.
+PostgreSQL 19 can tell the two apart and report `update_deleted`, if the
+subscription keeps deleted rows around long enough to look at them. That's the
+subscription option `retain_dead_tuples`. It also needs `track_commit_timestamp`,
+which cider turns on.
+
+Turn it on for the subscription on `dolores-1`, the node that will receive the
+update. It can only be changed while the subscription is disabled. If `SET`
+says the worker is still running, wait a moment and run it again:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 DISABLE;
+ALTER SUBSCRIPTION from_dolores_2 SET (retain_dead_tuples = true);
+ALTER SUBSCRIPTION from_dolores_2 ENABLE;
+```
+
+That creates a physical replication slot on `dolores-1`, `pg_conflict_detection`,
+whose `xmin` stops VACUUM removing the deleted rows:
+
+```sql
+SELECT slot_name, slot_type, xmin FROM pg_replication_slots;
+--  from_dolores_1        | logical  |
+--  pg_conflict_detection | physical | 689
+```
+
+Start with a row both nodes have:
+
+```sql
+INSERT INTO pingpong VALUES (200, 'original');
+```
+
+Pause **both** subscriptions before changing anything. Otherwise the delete
+reaches `dolores-2` before the update does, and there's nothing left to update.
+
+On `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 DISABLE;
+```
+
+On `dolores-2`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_1 DISABLE;
+```
+
+Then delete on `dolores-1`:
+
+```sql
+DELETE FROM pingpong WHERE id = 200;
+```
+
+update on `dolores-2`, and resume there:
+
+```sql
+UPDATE pingpong SET msg = 'updated on dolores-2' WHERE id = 200;
+ALTER SUBSCRIPTION from_dolores_1 ENABLE;
+```
+
+and resume on `dolores-1`:
+
+```sql
+ALTER SUBSCRIPTION from_dolores_2 ENABLE;
+```
+
+Each node logs its side of it, and replication carries on:
+
+```
+  dolores-1     logical   pp   from_dolores_2 streaming · conflicts: update_deleted 1
+  dolores-2     logical   pp   from_dolores_1 streaming · conflicts: delete_origin_differs 1
+```
+
+```
+LOG:     conflict detected on relation "public.pingpong": conflict=update_deleted
+DETAIL:  Could not find the row to be updated: remote row (200, updated on dolores-2), replica identity (id)=(200).
+         The row to be updated was deleted locally in transaction 691 at 2026-10-12 16:57:20.061431+00.
+```
+
+`dolores-2` applied the incoming delete (the remote side wins), and `dolores-1`
+skipped the incoming update. So both nodes end up without row 200, and the
+update is lost on both, with only the log and the counters saying so. Without
+`retain_dead_tuples`, the same steps log `update_missing` on `dolores-1` instead.
+
+What it costs:
+
+- **Dead rows stay until the slot moves on.** While the subscription runs,
+  the slot's `xmin` keeps moving forward by itself. While it's disabled, the
+  `xmin` stays put and dead rows pile up. Postgres warns about that at
+  `DISABLE`.
+- **`max_retention_duration`** (milliseconds, `0` by default, meaning no limit)
+  caps that. According to the
+  [documentation](https://www.postgresql.org/docs/19/sql-createsubscription.html),
+  once the apply worker can't move the slot forward within that time,
+  Postgres stops retaining (`pg_subscription.subretentionactive` goes `false`)
+  and `update_deleted` detection pauses until the worker catches up. It isn't
+  easy to trip on demand: an open transaction on the publisher didn't hold the
+  slot back on 19beta4.
+- **One slot per node,** however many subscriptions on it use the option.
+  Setting the option back to `false` (with the subscription disabled again)
+  drops the slot.
 
 To start again from nothing, run
 `./cider logical pomace -y && ./cider logical build && ./cider logical up`.
